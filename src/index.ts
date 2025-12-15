@@ -1,1 +1,1 @@
-export * from './eventstore';
+export * from './app/EventStore';

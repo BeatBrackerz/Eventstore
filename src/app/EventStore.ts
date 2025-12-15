@@ -10,7 +10,7 @@ import {
     QueryEventsOptions,
     ReplayOptions,
     SnapshotRecord
-} from "./types";
+} from "../domain";
 
 /**
  * Supabase Event Store
