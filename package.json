@@ -1,0 +1,29 @@
+{
+  "name": "@beatbrackerz/eventstore",
+  "version": "1.0.0",
+  "description": "Reusable event store implementation for Supabase with optimized performance and support for event sourcing patterns.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.87.1",
+    "ioredis": "^5.8.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beatbrackerz/eventstore.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com/"
+  },
+  "license": "MIT"
+}
