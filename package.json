@@ -3,12 +3,23 @@
   "version": "1.0.0",
   "description": "Reusable event store implementation for Supabase with optimized performance and support for event sourcing patterns.",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "module": "dist/esm/index.js",
+  "types": "dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/cjs/index.js",
+      "import": "./dist/esm/index.js",
+      "types": "./dist/types/index.d.ts"
+    }
+  },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "clean": "rimraf dist",
+    "build:cjs": "tsc -p tsconfig.cjs.json",
+    "build:esm": "tsc -p tsconfig.esm.json",
+    "build": "npm run clean && npm run build:cjs && npm run build:esm",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -16,6 +27,7 @@
     "ioredis": "^5.8.2"
   },
   "devDependencies": {
+    "rimraf": "^6.1.2",
     "typescript": "^5.5.3"
   },
   "repository": {
