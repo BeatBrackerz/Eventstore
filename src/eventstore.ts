@@ -1,15 +1,16 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import { Redis } from 'ioredis';
-import {CacheConfig} from "./types/config";
 import {
+    CacheConfig,
     CreateEventInput,
+    CreateSnapshotInput,
     EventProjection,
     EventRecord,
     EventStoreError,
     QueryEventsOptions,
-    ReplayOptions
-} from "./types/event";
-import {CreateSnapshotInput, SnapshotRecord} from "./types/snapshot";
+    ReplayOptions,
+    SnapshotRecord
+} from "./types";
 
 /**
  * Supabase Event Store
