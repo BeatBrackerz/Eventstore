@@ -95,11 +95,15 @@ export class RedisCacheService implements ICacheService {
         }
     }
 
-    cacheKey(...parts: string[]): string {
+    buildCacheKey(...parts: string[]): string {
         return `${this.keyPrefix}${parts.join(':')}`;
     }
 
     getTTL(type: keyof Required<CacheConfig['ttl']>): number {
         return this.ttl[type];
+    }
+
+    getRedisClient(): Redis {
+        return this.redis;
     }
 }

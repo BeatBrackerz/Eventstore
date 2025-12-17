@@ -1,237 +1,58 @@
-import { SupabaseClient } from '@supabase/supabase-js';
-import { Redis } from 'ioredis';
+import {SupabaseClient} from "@supabase/supabase-js";
+import {Redis} from "ioredis";
 import {
     CacheConfig,
-    CreateEventInput,
-    CreateSnapshotInput,
+    CreateEventInput, CreateSnapshotInput,
     EventProjection,
     EventRecord,
     EventStoreError,
-    QueryEventsOptions,
-    ReplayOptions,
-    SnapshotRecord
+    QueryEventsOptions, ReplayOptions, SnapshotRecord
 } from "../domain";
+import {
+    NoOpCacheService,
+    RedisCacheService,
+    SupabaseEventPublisher,
+    SupabaseEventRepository, SupabaseSequenceRepository,
+    SupabaseSnapshotRepository
+} from "../adapters";
+import {ICacheService, IEventPublisher, IEventRepository, ISequenceRepository, ISnapshotRepository} from "../ports";
 
 /**
- * Supabase Event Store
- *
- * A generalized event store implementation for Supabase with optimized performance
- * and support for event sourcing patterns.
+ * Event Store Service Configuration
  */
-export class SupabaseEventStore {
-    private readonly EVENTS_TABLE = 'events';
-    private readonly SEQUENCES_TABLE = 'aggregate_sequences';
-    private readonly SNAPSHOTS_TABLE = 'snapshots';
+export interface EventStoreConfig {
+    eventRepository: IEventRepository;
+    sequenceRepository: ISequenceRepository;
+    snapshotRepository: ISnapshotRepository;
+    cacheService: ICacheService;
+    eventPublisher?: IEventPublisher;
+}
 
-    private readonly cache: {
-        enabled: boolean;
-        redis?: Redis;
-        ttl: {
-            events: number;
-            snapshots: number;
-            sequences: number;
-            aggregateEvents: number;
-        };
-        keyPrefix: string;
-    };
-
-    constructor(
-        private readonly supabase: SupabaseClient,
-        cacheConfig: CacheConfig = {}
-    ) {
-        this.cache = {
-            enabled: cacheConfig.enabled ?? !!cacheConfig.redis,
-            redis: cacheConfig.redis,
-            ttl: {
-                events: cacheConfig.ttl?.events ?? 3600,
-                snapshots: cacheConfig.ttl?.snapshots ?? 7200,
-                sequences: cacheConfig.ttl?.sequences ?? 300,
-                aggregateEvents: cacheConfig.ttl?.aggregateEvents ?? 1800,
-            },
-            keyPrefix: cacheConfig.keyPrefix ?? 'es:',
-        };
-    }
+/**
+ * Event Store Service - Core Business Logic
+ */
+export class EventStore {
+    constructor(private readonly config: EventStoreConfig) {}
 
     // ============================================================================
-    // CACHE UTILITIES
+    // EVENT OPERATIONS
     // ============================================================================
-
-    /**
-     * Generate cache key
-     */
-    private cacheKey(...parts: string[]): string {
-        return `${this.cache.keyPrefix}${parts.join(':')}`;
-    }
-
-    /**
-     * Get from cache
-     */
-    private async getCached<T>(key: string): Promise<T | null> {
-        if (!this.cache.enabled || !this.cache.redis) return null;
-
-        try {
-            const data = await this.cache.redis.get(key);
-            return data ? JSON.parse(data) : null;
-        } catch (err) {
-            console.error('Cache read error:', err);
-            return null;
-        }
-    }
-
-    /**
-     * Set in cache
-     */
-    private async setCached<T>(key: string, value: T, ttl: number): Promise<void> {
-        if (!this.cache.enabled || !this.cache.redis) return;
-
-        try {
-            await this.cache.redis.setex(key, ttl, JSON.stringify(value));
-        } catch (err) {
-            console.error('Cache write error:', err);
-        }
-    }
-
-    /**
-     * Delete from cache
-     */
-    private async deleteCached(key: string): Promise<void> {
-        if (!this.cache.enabled || !this.cache.redis) return;
-
-        try {
-            await this.cache.redis.del(key);
-        } catch (err) {
-            console.error('Cache delete error:', err);
-        }
-    }
-
-    /**
-     * Delete multiple keys matching pattern
-     */
-    private async deleteCachedPattern(pattern: string): Promise<void> {
-        if (!this.cache.enabled || !this.cache.redis) return;
-
-        try {
-            const keys = await this.cache.redis.keys(pattern);
-            if (keys.length > 0) {
-                await this.cache.redis.del(...keys);
-            }
-        } catch (err) {
-            console.error('Cache pattern delete error:', err);
-        }
-    }
-
-    /**
-     * Invalidate all cache for an aggregate
-     */
-    private async invalidateAggregateCache(
-        aggregateId: string,
-        aggregateType: string
-    ): Promise<void> {
-        if (!this.cache.enabled || !this.cache.redis) return;
-
-        const patterns = [
-            this.cacheKey('agg', aggregateType, aggregateId, '*'),
-            this.cacheKey('snapshot', aggregateType, aggregateId, '*'),
-            this.cacheKey('seq', aggregateType, aggregateId),
-            this.cacheKey('stats', aggregateType, aggregateId),
-        ];
-
-        await Promise.all(patterns.map(p => this.deleteCachedPattern(p)));
-    }
-
-    /**
-     * Get multiple values from cache using pipeline
-     */
-    private async getCachedMultiple<T>(keys: string[]): Promise<Map<string, T>> {
-        if (!this.cache.enabled || !this.cache.redis || keys.length === 0) {
-            return new Map();
-        }
-
-        try {
-            const pipeline = this.cache.redis.pipeline();
-            keys.forEach(key => pipeline.get(key));
-            const results = await pipeline.exec();
-
-            const map = new Map<string, T>();
-            results?.forEach((result, index) => {
-                if (result && result[1]) {
-                    try {
-                        map.set(keys[index], JSON.parse(result[1] as string));
-                    } catch {
-                        // Skip invalid JSON
-                    }
-                }
-            });
-
-            return map;
-        } catch (err) {
-            console.error('Cache multi-read error:', err);
-            return new Map();
-        }
-    }
-
-    /**
-     * Set multiple values in cache using pipeline
-     */
-    private async setCachedMultiple<T>(
-        entries: Array<{ key: string; value: T; ttl: number }>
-    ): Promise<void> {
-        if (!this.cache.enabled || !this.cache.redis || entries.length === 0) return;
-
-        try {
-            const pipeline = this.cache.redis.pipeline();
-            entries.forEach(({ key, value, ttl }) => {
-                pipeline.setex(key, ttl, JSON.stringify(value));
-            });
-            await pipeline.exec();
-        } catch (err) {
-            console.error('Cache multi-write error:', err);
-        }
-    }
 
     /**
      * Append a single event to the event store
-     *
-     * @param event - Event to append
-     * @returns The created event record
      */
     async appendEvent(event: CreateEventInput): Promise<EventRecord> {
         try {
-            // Get next sequence number
-            const sequenceNumber = await this.getNextSequenceNumber(
+            const sequenceNumber = await this.config.sequenceRepository.getNextSequence(
                 event.aggregate_id,
                 event.aggregate_type
             );
 
-            // Insert event
-            const { data, error } = await this.supabase
-                .from(this.EVENTS_TABLE)
-                .insert({
-                    type: event.type,
-                    aggregate_id: event.aggregate_id,
-                    aggregate_type: event.aggregate_type,
-                    sequence_number: sequenceNumber,
-                    version: event.version ?? 1,
-                    payload: event.payload ?? {},
-                    metadata: event.metadata ?? {},
-                    created_by: event.created_by,
-                })
-                .select()
-                .single();
+            const savedEvent = await this.config.eventRepository.saveEvent(event, sequenceNumber);
 
-            if (error) {
-                throw new EventStoreError(`Failed to append event: ${error.message}`, error);
-            }
+            await this.invalidateAggregateCache(event.aggregate_id, event.aggregate_type);
 
-            const eventRecord = data as EventRecord;
-
-            // Invalidate cache for this aggregate
-            await this.invalidateAggregateCache(
-                event.aggregate_id,
-                event.aggregate_type
-            );
-
-            return eventRecord;
+            return savedEvent;
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to append event', err);
@@ -240,81 +61,36 @@ export class SupabaseEventStore {
 
     /**
      * Append multiple events atomically
-     *
-     * @param events - Events to append
-     * @returns Array of created event records
      */
     async appendEvents(events: CreateEventInput[]): Promise<EventRecord[]> {
         if (events.length === 0) return [];
 
         try {
-            // Group events by aggregate
-            const eventsByAggregate = new Map<string, CreateEventInput[]>();
+            const eventsByAggregate = this.groupEventsByAggregate(events);
+            const sequenceMap = await this.reserveSequences(eventsByAggregate);
 
-            for (const event of events) {
-                const key = `${event.aggregate_id}:${event.aggregate_type}`;
-                const group = eventsByAggregate.get(key) ?? [];
-                group.push(event);
-                eventsByAggregate.set(key, group);
-            }
-
-            // Get sequence numbers for each aggregate
-            const sequencePromises = Array.from(eventsByAggregate.entries()).map(
-                async ([key, evts]) => {
-                    const [aggregateId, aggregateType] = key.split(':');
-                    const startSequence = await this.getNextSequenceNumber(
-                        aggregateId,
-                        aggregateType,
-                        evts.length
-                    );
-                    return { key, startSequence };
-                }
-            );
-
-            const sequences = await Promise.all(sequencePromises);
-            const sequenceMap = new Map(
-                sequences.map(s => [s.key, s.startSequence])
-            );
-
-            // Prepare events with sequence numbers
-            const eventsToInsert = events.map((event, idx) => {
-                const key = `${event.aggregate_id}:${event.aggregate_type}`;
+            const eventsWithSequences = events.map(event => {
+                const key = this.aggregateKey(event.aggregate_id, event.aggregate_type);
                 const groupEvents = eventsByAggregate.get(key)!;
                 const indexInGroup = groupEvents.indexOf(event);
                 const startSequence = sequenceMap.get(key)!;
 
                 return {
-                    type: event.type,
-                    aggregate_id: event.aggregate_id,
-                    aggregate_type: event.aggregate_type,
-                    sequence_number: startSequence + indexInGroup,
-                    version: event.version ?? 1,
-                    payload: event.payload ?? {},
-                    metadata: event.metadata ?? {},
-                    created_by: event.created_by,
+                    event,
+                    sequenceNumber: startSequence + indexInGroup,
                 };
             });
 
-            // Insert all events
-            const { data, error } = await this.supabase
-                .from(this.EVENTS_TABLE)
-                .insert(eventsToInsert)
-                .select();
+            const savedEvents = await this.config.eventRepository.saveEvents(eventsWithSequences);
 
-            if (error) {
-                throw new EventStoreError(`Failed to append events: ${error.message}`, error);
-            }
+            await Promise.all(
+                Array.from(eventsByAggregate.keys()).map(key => {
+                    const [aggregateId, aggregateType] = key.split(':');
+                    return this.invalidateAggregateCache(aggregateId, aggregateType);
+                })
+            );
 
-            const eventRecords = data as EventRecord[];
-
-            // Invalidate cache for all affected aggregates
-            const invalidations = Array.from(eventsByAggregate.keys()).map(key => {
-                const [aggregateId, aggregateType] = key.split(':');
-                return this.invalidateAggregateCache(aggregateId, aggregateType);
-            });
-            await Promise.all(invalidations);
-
-            return eventRecords;
+            return savedEvents;
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to append events', err);
@@ -323,51 +99,10 @@ export class SupabaseEventStore {
 
     /**
      * Query events from the event store
-     *
-     * @param options - Query options
-     * @returns Array of event records
      */
     async queryEvents(options: QueryEventsOptions = {}): Promise<EventRecord[]> {
         try {
-            let query = this.supabase
-                .from(this.EVENTS_TABLE)
-                .select('*');
-
-            if (options.aggregate_id) {
-                query = query.eq('aggregate_id', options.aggregate_id);
-            }
-
-            if (options.aggregate_type) {
-                query = query.eq('aggregate_type', options.aggregate_type);
-            }
-
-            if (options.type) {
-                query = query.eq('type', options.type);
-            }
-
-            if (options.from_sequence !== undefined) {
-                query = query.gte('sequence_number', options.from_sequence);
-            }
-
-            if (options.to_sequence !== undefined) {
-                query = query.lte('sequence_number', options.to_sequence);
-            }
-
-            query = query.order('sequence_number', {
-                ascending: options.order !== 'desc',
-            });
-
-            if (options.limit) {
-                query = query.limit(options.limit);
-            }
-
-            const { data, error } = await query;
-
-            if (error) {
-                throw new EventStoreError(`Failed to query events: ${error.message}`, error);
-            }
-
-            return (data as EventRecord[]) ?? [];
+            return await this.config.eventRepository.findEvents(options);
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to query events', err);
@@ -376,265 +111,130 @@ export class SupabaseEventStore {
 
     /**
      * Get events for a specific aggregate
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @param fromSequence - Optional starting sequence number
-     * @returns Array of event records
      */
     async getAggregateEvents(
         aggregateId: string,
         aggregateType: string,
         fromSequence?: number
     ): Promise<EventRecord[]> {
-        const cacheKey = this.cacheKey(
-            'agg',
-            aggregateType,
-            aggregateId,
-            fromSequence?.toString() ?? 'all'
-        );
+        try {
+            const cacheKey = this.buildCacheKey('agg', aggregateType, aggregateId, fromSequence?.toString() ?? 'all');
 
-        // Try cache first
-        const cached = await this.getCached<EventRecord[]>(cacheKey);
-        if (cached) return cached;
+            const cached = await this.config.cacheService.get<EventRecord[]>(cacheKey);
+            if (cached) return cached;
 
-        // Fetch from database
-        const events = await this.queryEvents({
-            aggregate_id: aggregateId,
-            aggregate_type: aggregateType,
-            from_sequence: fromSequence,
-            order: 'asc',
-        });
+            const events = await this.config.eventRepository.findEventsByAggregate(
+                aggregateId,
+                aggregateType,
+                fromSequence
+            );
 
-        // Cache the result
-        await this.setCached(cacheKey, events, this.cache.ttl.aggregateEvents);
+            const ttl = this.getCacheTTL('aggregateEvents');
+            if (ttl > 0) {
+                await this.config.cacheService.set(cacheKey, events, ttl);
+            }
 
-        return events;
+            return events;
+        } catch (err) {
+            if (err instanceof EventStoreError) throw err;
+            throw new EventStoreError('Failed to get aggregate events', err);
+        }
     }
 
     /**
      * Get events by type
-     *
-     * @param type - Event type
-     * @param limit - Optional limit
-     * @returns Array of event records
      */
     async getEventsByType(type: string, limit?: number): Promise<EventRecord[]> {
-        return this.queryEvents({
-            type,
-            limit,
-            order: 'desc',
-        });
+        try {
+            return await this.config.eventRepository.findEventsByType(type, limit);
+        } catch (err) {
+            if (err instanceof EventStoreError) throw err;
+            throw new EventStoreError('Failed to get events by type', err);
+        }
     }
 
     /**
      * Get the latest event for an aggregate
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @returns The latest event or null
      */
     async getLatestEvent(
         aggregateId: string,
         aggregateType: string
     ): Promise<EventRecord | null> {
-        const events = await this.queryEvents({
-            aggregate_id: aggregateId,
-            aggregate_type: aggregateType,
-            order: 'desc',
-            limit: 1,
-        });
-
-        return events[0] ?? null;
+        try {
+            return await this.config.eventRepository.findLatestEvent(aggregateId, aggregateType);
+        } catch (err) {
+            if (err instanceof EventStoreError) throw err;
+            throw new EventStoreError('Failed to get latest event', err);
+        }
     }
 
     /**
      * Get current sequence number for an aggregate
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @returns Current sequence number
      */
     async getCurrentSequenceNumber(
         aggregateId: string,
         aggregateType: string
     ): Promise<number> {
-        const cacheKey = this.cacheKey('seq', aggregateType, aggregateId);
-
-        // Try cache first
-        const cached = await this.getCached<number>(cacheKey);
-        if (cached !== null) return cached;
-
-        // Fetch from database
-        const { data, error } = await this.supabase
-            .from(this.SEQUENCES_TABLE)
-            .select('last_sequence')
-            .eq('aggregate_id', aggregateId)
-            .eq('aggregate_type', aggregateType)
-            .single();
-
-        if (error && error.code !== 'PGRST116') {
-            throw new EventStoreError(
-                `Failed to get sequence number: ${error.message}`,
-                error
-            );
-        }
-
-        const sequence = data?.last_sequence ?? 0;
-
-        // Cache the result
-        await this.setCached(cacheKey, sequence, this.cache.ttl.sequences);
-
-        return sequence;
-    }
-
-    /**
-     * Get and increment the next sequence number(s) atomically
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @param count - Number of sequence numbers to reserve (default: 1)
-     * @returns Next sequence number
-     */
-    private async getNextSequenceNumber(
-        aggregateId: string,
-        aggregateType: string,
-        count: number = 1
-    ): Promise<number> {
         try {
-            // Invalidate sequence cache immediately
-            const cacheKey = this.cacheKey('seq', aggregateType, aggregateId);
-            await this.deleteCached(cacheKey);
+            const cacheKey = this.buildCacheKey('seq', aggregateType, aggregateId);
 
-            // Use upsert to atomically increment or create
-            const { data: currentData } = await this.supabase
-                .from(this.SEQUENCES_TABLE)
-                .select('last_sequence')
-                .eq('aggregate_id', aggregateId)
-                .eq('aggregate_type', aggregateType)
-                .single();
+            const cached = await this.config.cacheService.get<number>(cacheKey);
+            if (cached !== null) return cached;
 
-            const currentSequence = currentData?.last_sequence ?? 0;
-            const nextSequence = currentSequence + count;
+            const sequence = await this.config.sequenceRepository.getCurrentSequence(
+                aggregateId,
+                aggregateType
+            );
 
-            const { error } = await this.supabase
-                .from(this.SEQUENCES_TABLE)
-                .upsert({
-                    aggregate_id: aggregateId,
-                    aggregate_type: aggregateType,
-                    last_sequence: nextSequence,
-                });
-
-            if (error) {
-                throw new EventStoreError(
-                    `Failed to update sequence: ${error.message}`,
-                    error
-                );
+            const ttl = this.getCacheTTL('sequences');
+            if (ttl > 0) {
+                await this.config.cacheService.set(cacheKey, sequence, ttl);
             }
 
-            // Update cache with new sequence
-            await this.setCached(cacheKey, nextSequence, this.cache.ttl.sequences);
-
-            return currentSequence + 1;
+            return sequence;
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
-            throw new EventStoreError('Failed to get next sequence number', err);
+            throw new EventStoreError('Failed to get current sequence number', err);
         }
     }
 
     /**
-     * Stream events in real-time
-     *
-     * @param callback - Callback function for new events
-     * @param options - Optional query options for filtering
-     * @returns Unsubscribe function
+     * Subscribe to real-time events
      */
     subscribeToEvents(
         callback: (event: EventRecord) => void,
         options: Omit<QueryEventsOptions, 'limit' | 'order'> = {}
     ): () => void {
-        let channel = this.supabase
-            .channel('events-changes')
-            .on(
-                'postgres_changes',
-                {
-                    event: 'INSERT',
-                    schema: 'public',
-                    table: this.EVENTS_TABLE,
-                    filter: this.buildRealtimeFilter(options),
-                },
-                (payload) => {
-                    callback(payload.new as EventRecord);
-                }
-            )
-            .subscribe();
-
-        return () => {
-            channel.unsubscribe();
-        };
-    }
-
-    /**
-     * Build realtime filter string from query options
-     */
-    private buildRealtimeFilter(options: Omit<QueryEventsOptions, 'limit' | 'order'>): string | undefined {
-        const filters: string[] = [];
-
-        if (options.aggregate_id) {
-            filters.push(`aggregate_id=eq.${options.aggregate_id}`);
+        if (!this.config.eventPublisher) {
+            throw new EventStoreError('Event publisher not configured');
         }
-
-        if (options.aggregate_type) {
-            filters.push(`aggregate_type=eq.${options.aggregate_type}`);
-        }
-
-        if (options.type) {
-            filters.push(`type=eq.${options.type}`);
-        }
-
-        return filters.length > 0 ? filters.join(',') : undefined;
+        return this.config.eventPublisher.subscribe(callback, options);
     }
 
     // ============================================================================
-    // SNAPSHOT MANAGEMENT
+    // SNAPSHOT OPERATIONS
     // ============================================================================
 
     /**
      * Create a snapshot of an aggregate's current state
-     *
-     * @param snapshot - Snapshot data
-     * @returns Created snapshot record
      */
     async createSnapshot(snapshot: CreateSnapshotInput): Promise<SnapshotRecord> {
         try {
-            const { data, error } = await this.supabase
-                .from(this.SNAPSHOTS_TABLE)
-                .insert({
-                    aggregate_id: snapshot.aggregate_id,
-                    aggregate_type: snapshot.aggregate_type,
-                    sequence_number: snapshot.sequence_number,
-                    state: snapshot.state,
-                    version: snapshot.version ?? 1,
-                })
-                .select()
-                .single();
+            const saved = await this.config.snapshotRepository.saveSnapshot(snapshot);
 
-            if (error) {
-                throw new EventStoreError(`Failed to create snapshot: ${error.message}`, error);
-            }
-
-            const snapshotRecord = data as SnapshotRecord;
-
-            // Cache the snapshot
-            const cacheKey = this.cacheKey(
+            const cacheKey = this.buildCacheKey(
                 'snapshot',
                 snapshot.aggregate_type,
                 snapshot.aggregate_id,
                 'latest'
             );
-            await this.setCached(cacheKey, snapshotRecord, this.cache.ttl.snapshots);
 
-            return snapshotRecord;
+            const ttl = this.getCacheTTL('snapshots');
+            if (ttl > 0) {
+                await this.config.cacheService.set(cacheKey, saved, ttl);
+            }
+
+            return saved;
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to create snapshot', err);
@@ -643,56 +243,38 @@ export class SupabaseEventStore {
 
     /**
      * Get the latest snapshot for an aggregate
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @returns Latest snapshot or null
      */
     async getLatestSnapshot(
         aggregateId: string,
         aggregateType: string
     ): Promise<SnapshotRecord | null> {
-        const cacheKey = this.cacheKey('snapshot', aggregateType, aggregateId, 'latest');
-
-        // Try cache first
-        const cached = await this.getCached<SnapshotRecord>(cacheKey);
-        if (cached) return cached;
-
         try {
-            const { data, error } = await this.supabase
-                .from(this.SNAPSHOTS_TABLE)
-                .select('*')
-                .eq('aggregate_id', aggregateId)
-                .eq('aggregate_type', aggregateType)
-                .order('sequence_number', { ascending: false })
-                .limit(1)
-                .single();
+            const cacheKey = this.buildCacheKey('snapshot', aggregateType, aggregateId, 'latest');
 
-            if (error && error.code !== 'PGRST116') {
-                throw new EventStoreError(`Failed to get snapshot: ${error.message}`, error);
-            }
+            const cached = await this.config.cacheService.get<SnapshotRecord>(cacheKey);
+            if (cached) return cached;
 
-            const snapshot = (data as SnapshotRecord) ?? null;
+            const snapshot = await this.config.snapshotRepository.findLatestSnapshot(
+                aggregateId,
+                aggregateType
+            );
 
-            // Cache the result (including null to prevent repeated DB queries)
             if (snapshot) {
-                await this.setCached(cacheKey, snapshot, this.cache.ttl.snapshots);
+                const ttl = this.getCacheTTL('snapshots');
+                if (ttl > 0) {
+                    await this.config.cacheService.set(cacheKey, snapshot, ttl);
+                }
             }
 
             return snapshot;
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
-            throw new EventStoreError('Failed to get snapshot', err);
+            throw new EventStoreError('Failed to get latest snapshot', err);
         }
     }
 
     /**
-     * Get a specific snapshot by sequence number
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @param sequenceNumber - Sequence number
-     * @returns Snapshot or null
+     * Get a snapshot at a specific sequence number
      */
     async getSnapshotAtSequence(
         aggregateId: string,
@@ -700,21 +282,11 @@ export class SupabaseEventStore {
         sequenceNumber: number
     ): Promise<SnapshotRecord | null> {
         try {
-            const { data, error } = await this.supabase
-                .from(this.SNAPSHOTS_TABLE)
-                .select('*')
-                .eq('aggregate_id', aggregateId)
-                .eq('aggregate_type', aggregateType)
-                .lte('sequence_number', sequenceNumber)
-                .order('sequence_number', { ascending: false })
-                .limit(1)
-                .single();
-
-            if (error && error.code !== 'PGRST116') {
-                throw new EventStoreError(`Failed to get snapshot: ${error.message}`, error);
-            }
-
-            return (data as SnapshotRecord) ?? null;
+            return await this.config.snapshotRepository.findSnapshotAtSequence(
+                aggregateId,
+                aggregateType,
+                sequenceNumber
+            );
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to get snapshot at sequence', err);
@@ -723,11 +295,6 @@ export class SupabaseEventStore {
 
     /**
      * Delete old snapshots, keeping only the N most recent
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @param keepCount - Number of snapshots to keep (default: 3)
-     * @returns Number of deleted snapshots
      */
     async pruneSnapshots(
         aggregateId: string,
@@ -735,31 +302,11 @@ export class SupabaseEventStore {
         keepCount: number = 3
     ): Promise<number> {
         try {
-            // Get snapshots to delete
-            const { data: snapshots } = await this.supabase
-                .from(this.SNAPSHOTS_TABLE)
-                .select('id, sequence_number')
-                .eq('aggregate_id', aggregateId)
-                .eq('aggregate_type', aggregateType)
-                .order('sequence_number', { ascending: false });
-
-            if (!snapshots || snapshots.length <= keepCount) {
-                return 0;
-            }
-
-            const toDelete = snapshots.slice(keepCount);
-            const idsToDelete = toDelete.map(s => s.id);
-
-            const { error } = await this.supabase
-                .from(this.SNAPSHOTS_TABLE)
-                .delete()
-                .in('id', idsToDelete);
-
-            if (error) {
-                throw new EventStoreError(`Failed to prune snapshots: ${error.message}`, error);
-            }
-
-            return toDelete.length;
+            return await this.config.snapshotRepository.deleteOldSnapshots(
+                aggregateId,
+                aggregateType,
+                keepCount
+            );
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to prune snapshots', err);
@@ -772,12 +319,6 @@ export class SupabaseEventStore {
 
     /**
      * Replay events and build aggregate state using a projection
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @param projection - Projection defining how to apply events
-     * @param options - Replay options
-     * @returns Final state after applying all events
      */
     async replayEvents<T>(
         aggregateId: string,
@@ -786,7 +327,6 @@ export class SupabaseEventStore {
         options: ReplayOptions = {}
     ): Promise<T> {
         try {
-            // Try to load from snapshot first
             let state = projection.initialState;
             let fromSequence = options.from_sequence ?? 1;
 
@@ -798,7 +338,6 @@ export class SupabaseEventStore {
                 }
             }
 
-            // Get events to replay
             const events = await this.queryEvents({
                 aggregate_id: aggregateId,
                 aggregate_type: aggregateType,
@@ -807,7 +346,6 @@ export class SupabaseEventStore {
                 order: 'asc',
             });
 
-            // Apply events to state
             for (const event of events) {
                 state = projection.applyEvent(state, event);
             }
@@ -821,11 +359,6 @@ export class SupabaseEventStore {
 
     /**
      * Replay events in batches with callback for each batch
-     * Useful for large event streams and rebuilding read models
-     *
-     * @param options - Query options for filtering events
-     * @param batchCallback - Callback invoked for each batch of events
-     * @param batchSize - Number of events per batch (default: 100)
      */
     async replayEventStream(
         options: Omit<QueryEventsOptions, 'limit'>,
@@ -845,10 +378,7 @@ export class SupabaseEventStore {
                     order: 'asc',
                 });
 
-                if (events.length === 0) {
-                    hasMore = false;
-                    break;
-                }
+                if (events.length === 0) break;
 
                 await batchCallback(events, batchNumber);
 
@@ -867,12 +397,6 @@ export class SupabaseEventStore {
 
     /**
      * Rebuild aggregate state with automatic snapshotting
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @param projection - Projection defining how to apply events
-     * @param snapshotInterval - Create snapshot every N events (default: 50)
-     * @returns Final state
      */
     async rebuildWithSnapshots<T>(
         aggregateId: string,
@@ -884,14 +408,12 @@ export class SupabaseEventStore {
             let state = projection.initialState;
             let lastSnapshotSequence = 0;
 
-            // Get latest snapshot
             const snapshot = await this.getLatestSnapshot(aggregateId, aggregateType);
             if (snapshot) {
                 state = snapshot.state;
                 lastSnapshotSequence = snapshot.sequence_number;
             }
 
-            // Get events since last snapshot
             const events = await this.queryEvents({
                 aggregate_id: aggregateId,
                 aggregate_type: aggregateType,
@@ -899,12 +421,10 @@ export class SupabaseEventStore {
                 order: 'asc',
             });
 
-            // Apply events and create snapshots periodically
             for (let i = 0; i < events.length; i++) {
                 const event = events[i];
                 state = projection.applyEvent(state, event);
 
-                // Create snapshot at intervals
                 if ((i + 1) % snapshotInterval === 0) {
                     await this.createSnapshot({
                         aggregate_id: aggregateId,
@@ -915,7 +435,6 @@ export class SupabaseEventStore {
                 }
             }
 
-            // Create final snapshot if we processed events
             if (events.length > 0) {
                 const lastEvent = events[events.length - 1];
                 if (lastEvent.sequence_number > lastSnapshotSequence) {
@@ -937,12 +456,6 @@ export class SupabaseEventStore {
 
     /**
      * Get aggregate state at a specific point in time
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @param projection - Projection defining how to apply events
-     * @param sequenceNumber - Sequence number to replay up to
-     * @returns State at the specified sequence
      */
     async getStateAtSequence<T>(
         aggregateId: string,
@@ -957,10 +470,6 @@ export class SupabaseEventStore {
 
     /**
      * Get event statistics for an aggregate
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @returns Statistics object
      */
     async getAggregateStats(
         aggregateId: string,
@@ -971,24 +480,25 @@ export class SupabaseEventStore {
         lastEvent: EventRecord | null;
         eventTypes: Map<string, number>;
     }> {
-        const cacheKey = this.cacheKey('stats', aggregateType, aggregateId);
-
-        // Try cache first
-        const cached = await this.getCached<{
-            totalEvents: number;
-            firstEvent: EventRecord | null;
-            lastEvent: EventRecord | null;
-            eventTypes: Array<[string, number]>;
-        }>(cacheKey);
-
-        if (cached) {
-            return {
-                ...cached,
-                eventTypes: new Map(cached.eventTypes),
-            };
-        }
-
         try {
+            const cacheKey = this.buildCacheKey('stats', aggregateType, aggregateId);
+
+            const cached = await this.config.cacheService.get<{
+                totalEvents: number;
+                firstEvent: EventRecord | null;
+                lastEvent: EventRecord | null;
+                eventTypes: Array<[string, number]>;
+            }>(cacheKey);
+
+            if (cached) {
+                return {
+                    totalEvents: cached.totalEvents,
+                    firstEvent: cached.firstEvent,
+                    lastEvent: cached.lastEvent,
+                    eventTypes: new Map(cached.eventTypes),
+                };
+            }
+
             const events = await this.getAggregateEvents(aggregateId, aggregateType);
 
             const eventTypes = new Map<string, number>();
@@ -1003,11 +513,15 @@ export class SupabaseEventStore {
                 eventTypes: Array.from(eventTypes.entries()),
             };
 
-            // Cache the stats
-            await this.setCached(cacheKey, stats, this.cache.ttl.aggregateEvents);
+            const ttl = this.getCacheTTL('aggregateEvents');
+            if (ttl > 0) {
+                await this.config.cacheService.set(cacheKey, stats, ttl);
+            }
 
             return {
-                ...stats,
+                totalEvents: stats.totalEvents,
+                firstEvent: stats.firstEvent,
+                lastEvent: stats.lastEvent,
                 eventTypes: new Map(stats.eventTypes),
             };
         } catch (err) {
@@ -1018,10 +532,6 @@ export class SupabaseEventStore {
 
     /**
      * Validate event stream consistency for an aggregate
-     *
-     * @param aggregateId - Aggregate ID
-     * @param aggregateType - Aggregate type
-     * @returns Validation result with any issues found
      */
     async validateEventStream(
         aggregateId: string,
@@ -1038,20 +548,19 @@ export class SupabaseEventStore {
                 return { valid: true, issues: [] };
             }
 
-            // Check sequence continuity
             for (let i = 0; i < events.length; i++) {
                 const expectedSequence = i + 1;
                 if (events[i].sequence_number !== expectedSequence) {
                     issues.push(
-                        `Sequence gap detected: expected ${expectedSequence}, got ${events[i].sequence_number}`
+                        `Sequence gap: expected ${expectedSequence}, got ${events[i].sequence_number}`
                     );
                 }
             }
 
-            // Check aggregate consistency
             const wrongAggregate = events.find(
                 e => e.aggregate_id !== aggregateId || e.aggregate_type !== aggregateType
             );
+
             if (wrongAggregate) {
                 issues.push('Events with mismatched aggregate ID or type found');
             }
@@ -1074,11 +583,9 @@ export class SupabaseEventStore {
      * Clear all cache
      */
     async clearCache(): Promise<void> {
-        if (!this.cache.enabled || !this.cache.redis) return;
-
         try {
-            const pattern = `${this.cache.keyPrefix}*`;
-            await this.deleteCachedPattern(pattern);
+            const pattern = this.buildCacheKey('*');
+            await this.config.cacheService.deletePattern(pattern);
         } catch (err) {
             console.error('Failed to clear cache:', err);
         }
@@ -1087,25 +594,15 @@ export class SupabaseEventStore {
     /**
      * Clear cache for specific aggregate
      */
-    async clearAggregateCache(
-        aggregateId: string,
-        aggregateType: string
-    ): Promise<void> {
+    async clearAggregateCache(aggregateId: string, aggregateType: string): Promise<void> {
         await this.invalidateAggregateCache(aggregateId, aggregateType);
     }
 
     /**
      * Warm up cache for an aggregate
-     * Pre-loads commonly accessed data into cache
      */
-    async warmupCache(
-        aggregateId: string,
-        aggregateType: string
-    ): Promise<void> {
-        if (!this.cache.enabled) return;
-
+    async warmupCache(aggregateId: string, aggregateType: string): Promise<void> {
         try {
-            // Warm up in parallel
             await Promise.all([
                 this.getAggregateEvents(aggregateId, aggregateType),
                 this.getLatestSnapshot(aggregateId, aggregateType),
@@ -1122,21 +619,30 @@ export class SupabaseEventStore {
      */
     async getCacheStats(): Promise<{
         enabled: boolean;
-        redis: boolean;
+        type: string;
         info?: {
             keys: number;
             memory: string;
         };
     }> {
-        const stats: any = {
-            enabled: this.cache.enabled,
-            redis: !!this.cache.redis,
+        const stats: {
+            enabled: boolean;
+            type: string;
+            info?: {
+                keys: number;
+                memory: string;
+            };
+        } = {
+            enabled: !(this.config.cacheService instanceof NoOpCacheService),
+            type: this.config.cacheService.constructor.name,
         };
 
-        if (this.cache.redis) {
+        if (this.config.cacheService instanceof RedisCacheService) {
             try {
-                const keys = await this.cache.redis.keys(`${this.cache.keyPrefix}*`);
-                const info = await this.cache.redis.info('memory');
+                const redis = this.config.cacheService.getRedisClient();
+                const pattern = this.buildCacheKey('*');
+                const keys = await redis.keys(pattern);
+                const info = await redis.info('memory');
                 const memoryMatch = info.match(/used_memory_human:([^\r\n]+)/);
 
                 stats.info = {
@@ -1150,21 +656,129 @@ export class SupabaseEventStore {
 
         return stats;
     }
+
+    // ============================================================================
+    // PRIVATE HELPERS
+    // ============================================================================
+
+    /**
+     * Build cache key with proper prefix
+     */
+    private buildCacheKey(...parts: string[]): string {
+        if (this.config.cacheService instanceof RedisCacheService) {
+            return this.config.cacheService.buildCacheKey(...parts);
+        }
+        return parts.join(':');
+    }
+
+    /**
+     * Get cache TTL for a specific type
+     */
+    private getCacheTTL(type: 'events' | 'snapshots' | 'sequences' | 'aggregateEvents'): number {
+        if (this.config.cacheService instanceof RedisCacheService) {
+            return this.config.cacheService.getTTL(type);
+        }
+        return 0;
+    }
+
+    /**
+     * Group events by aggregate
+     */
+    private groupEventsByAggregate(events: CreateEventInput[]): Map<string, CreateEventInput[]> {
+        const map = new Map<string, CreateEventInput[]>();
+
+        for (const event of events) {
+            const key = this.aggregateKey(event.aggregate_id, event.aggregate_type);
+            const group = map.get(key) ?? [];
+            group.push(event);
+            map.set(key, group);
+        }
+
+        return map;
+    }
+
+    /**
+     * Reserve sequence numbers for multiple aggregates
+     */
+    private async reserveSequences(
+        eventsByAggregate: Map<string, CreateEventInput[]>
+    ): Promise<Map<string, number>> {
+        const sequencePromises = Array.from(eventsByAggregate.entries()).map(
+            async ([key, events]) => {
+                const [aggregateId, aggregateType] = key.split(':');
+                const startSequence = await this.config.sequenceRepository.getNextSequence(
+                    aggregateId,
+                    aggregateType,
+                    events.length
+                );
+                return { key, startSequence };
+            }
+        );
+
+        const sequences = await Promise.all(sequencePromises);
+        return new Map(sequences.map(s => [s.key, s.startSequence]));
+    }
+
+    /**
+     * Invalidate all cache entries for an aggregate
+     */
+    private async invalidateAggregateCache(aggregateId: string, aggregateType: string): Promise<void> {
+        const patterns = [
+            this.buildCacheKey('agg', aggregateType, aggregateId) + '*',
+            this.buildCacheKey('snapshot', aggregateType, aggregateId) + '*',
+            this.buildCacheKey('seq', aggregateType, aggregateId),
+            this.buildCacheKey('stats', aggregateType, aggregateId),
+        ];
+
+        await Promise.all(patterns.map(p => this.config.cacheService.deletePattern(p)));
+    }
+
+    /**
+     * Generate aggregate key
+     */
+    private aggregateKey(aggregateId: string, aggregateType: string): string {
+        return `${aggregateId}:${aggregateType}`;
+    }
+}
+
+// ============================================================================
+// FACTORY - Builder for Event Store with Supabase
+// ============================================================================
+
+/**
+ * Event Store Builder Configuration
+ */
+export interface EventStoreBuilderConfig {
+    supabase: SupabaseClient;
+    redis?: Redis;
+    cache?: CacheConfig;
+    enablePublisher?: boolean;
 }
 
 /**
- * Create a new event store instance
- *
- * @param supabase - Supabase client
- * @param cacheConfig - Optional cache configuration
- * @returns Event store instance
+ * Factory function to create Event Store with Supabase adapters
  */
-export function createEventStore(
-    supabase: SupabaseClient,
-    cacheConfig?: CacheConfig
-): SupabaseEventStore {
-    return new SupabaseEventStore(supabase, cacheConfig);
+export function createEventStore(config: EventStoreBuilderConfig): EventStore {
+    const eventRepository = new SupabaseEventRepository(config.supabase);
+    const sequenceRepository = new SupabaseSequenceRepository(config.supabase);
+    const snapshotRepository = new SupabaseSnapshotRepository(config.supabase);
+
+    const cacheService = config.redis
+        ? new RedisCacheService(config.redis, config.cache)
+        : new NoOpCacheService();
+
+    const eventPublisher = config.enablePublisher
+        ? new SupabaseEventPublisher(config.supabase)
+        : undefined;
+
+    return new EventStore({
+        eventRepository,
+        sequenceRepository,
+        snapshotRepository,
+        cacheService,
+        eventPublisher,
+    });
 }
 
 // Default export
-export default SupabaseEventStore;
+export default EventStore;
