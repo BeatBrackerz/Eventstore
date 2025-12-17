@@ -1,6 +1,6 @@
 {
   "name": "@beatbrackerz/eventstore",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Reusable event store implementation for Supabase with optimized performance and support for event sourcing patterns.",
   "main": "dist/index.js",
   "module": "dist/esm/index.js",

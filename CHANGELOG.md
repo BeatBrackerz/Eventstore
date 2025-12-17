@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/beatbrackerz/eventstore/compare/v1.0.0...v1.1.0) (2025-12-17)
+
+
+### Features
+
+* Introduce modular architecture with Supabase adapters and ports for event storage, caching, sequencing, and snapshots. ([2455927](https://github.com/beatbrackerz/eventstore/commit/2455927a228f2495f8a5cde1b1041d21bf25c44c))
+
 # 1.0.0 (2025-12-15)
 
 
