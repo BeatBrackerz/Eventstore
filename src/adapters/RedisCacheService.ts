@@ -6,7 +6,12 @@ import {Redis} from "ioredis";
  * Adapter: Redis Cache Service
  */
 export class RedisCacheService implements ICacheService {
-    private readonly ttl: Required<CacheConfig['ttl']>;
+    private readonly ttl: {
+        events: number;
+        snapshots: number;
+        sequences: number;
+        aggregateEvents: number;
+    };
     private readonly keyPrefix: string;
 
     constructor(
@@ -99,8 +104,8 @@ export class RedisCacheService implements ICacheService {
         return `${this.keyPrefix}${parts.join(':')}`;
     }
 
-    getTTL(type: keyof Required<CacheConfig['ttl']>): number {
-        return this.ttl[type];
+    getTTL(type: 'events' | 'snapshots' | 'sequences' | 'aggregateEvents'): number {
+        return this.ttl[type] ?? 0;
     }
 
     getRedisClient(): Redis {
