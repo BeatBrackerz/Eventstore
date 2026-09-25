@@ -1,6 +1,6 @@
-import {IEventPublisher} from "../ports";
-import {SupabaseClient} from "@supabase/supabase-js";
-import {EventRecord, QueryEventsOptions} from "../domain";
+import type {IEventPublisher} from "../ports/index.js";
+import type {AnySupabaseClient} from "./supabaseSupport.js";
+import type {EventRecord, QueryEventsOptions} from "../domain/index.js";
 
 /**
  * Adapter: Supabase Event Publisher
@@ -8,7 +8,7 @@ import {EventRecord, QueryEventsOptions} from "../domain";
 export class SupabaseEventPublisher implements IEventPublisher {
     private readonly tableName = 'events';
 
-    constructor(private readonly client: SupabaseClient) {}
+    constructor(private readonly client: AnySupabaseClient) {}
 
     subscribe(callback: (event: EventRecord) => void, filter?: QueryEventsOptions): () => void {
         const filterStr = this.buildRealtimeFilter(filter);

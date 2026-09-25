@@ -1,11 +1,18 @@
-import {ICacheService} from "../ports";
-import {CacheConfig} from "../domain";
-import {Redis} from "ioredis";
+import type {ICacheService} from "../ports/index.js";
+import type {CacheConfig, RedisClientLike} from "../domain/index.js";
+
+const SCAN_BATCH = 500;
 
 /**
  * Adapter: Redis Cache Service
+ *
+ * Works with any client matching {@link RedisClientLike}, e.g. `ioredis` `Redis` or `Cluster`.
+ * Uses non-blocking SCAN/UNLINK instead of KEYS/DEL and never sends multi-key commands
+ * across cluster slots.
  */
-export class RedisCacheService implements ICacheService {
+export class RedisCacheService<TClient extends RedisClientLike = RedisClientLike> implements ICacheService {
+    readonly scope = 'shared' as const;
+
     private readonly ttl: {
         events: number;
         snapshots: number;
@@ -15,7 +22,7 @@ export class RedisCacheService implements ICacheService {
     private readonly keyPrefix: string;
 
     constructor(
-        private readonly redis: Redis,
+        private readonly redis: TClient,
         config: CacheConfig = {}
     ) {
         this.ttl = {
@@ -38,8 +45,10 @@ export class RedisCacheService implements ICacheService {
     }
 
     async set<T>(key: string, value: T, ttl: number): Promise<void> {
+        if (!(ttl > 0) || value === undefined) return;
+
         try {
-            await this.redis.setex(key, ttl, JSON.stringify(value));
+            await this.redis.set(key, JSON.stringify(value), 'EX', Math.ceil(ttl));
         } catch (err) {
             console.error('Cache write error:', err);
         }
@@ -47,7 +56,18 @@ export class RedisCacheService implements ICacheService {
 
     async delete(key: string): Promise<void> {
         try {
-            await this.redis.del(key);
+            await this.redis.unlink(key);
+        } catch (err) {
+            console.error('Cache delete error:', err);
+        }
+    }
+
+    async deleteMany(keys: string[]): Promise<void> {
+        if (keys.length === 0) return;
+
+        try {
+            // One command per key: keys of an aggregate may live in different cluster slots
+            await Promise.all(keys.map(key => this.redis.unlink(key)));
         } catch (err) {
             console.error('Cache delete error:', err);
         }
@@ -55,8 +75,16 @@ export class RedisCacheService implements ICacheService {
 
     async deletePattern(pattern: string): Promise<void> {
         try {
-            const keys = await this.redis.keys(pattern);
-            if (keys.length > 0) await this.redis.del(...keys);
+            await Promise.all(this.scanNodes().map(async node => {
+                for await (const keys of scanKeys(node, pattern)) {
+                    if (keys.length === 0) continue;
+                    if (this.redis.nodes) {
+                        await Promise.all(keys.map(key => node.unlink(key)));
+                    } else {
+                        await node.unlink(...keys);
+                    }
+                }
+            }));
         } catch (err) {
             console.error('Cache pattern delete error:', err);
         }
@@ -65,39 +93,28 @@ export class RedisCacheService implements ICacheService {
     async getMultiple<T>(keys: string[]): Promise<Map<string, T>> {
         if (keys.length === 0) return new Map();
 
-        try {
-            const pipeline = this.redis.pipeline();
-            keys.forEach(key => pipeline.get(key));
-            const results = await pipeline.exec();
-
-            const map = new Map<string, T>();
-            results?.forEach((result, index) => {
-                if (result && result[1]) {
-                    try {
-                        map.set(keys[index], JSON.parse(result[1] as string));
-                    } catch {}
-                }
-            });
-
-            return map;
-        } catch (err) {
-            console.error('Cache multi-read error:', err);
-            return new Map();
-        }
+        const values = await Promise.all(keys.map(key => this.get<T>(key)));
+        const map = new Map<string, T>();
+        values.forEach((value, index) => {
+            if (value !== null) map.set(keys[index], value);
+        });
+        return map;
     }
 
     async setMultiple<T>(entries: Array<{ key: string; value: T; ttl: number }>): Promise<void> {
-        if (entries.length === 0) return;
+        await Promise.all(entries.map(({key, value, ttl}) => this.set(key, value, ttl)));
+    }
 
-        try {
-            const pipeline = this.redis.pipeline();
-            entries.forEach(({ key, value, ttl }) => {
-                pipeline.setex(key, ttl, JSON.stringify(value));
-            });
-            await pipeline.exec();
-        } catch (err) {
-            console.error('Cache multi-write error:', err);
-        }
+    /**
+     * Count keys matching a pattern (uses SCAN, safe on large keyspaces)
+     */
+    async countKeys(pattern: string): Promise<number> {
+        const counts = await Promise.all(this.scanNodes().map(async node => {
+            let count = 0;
+            for await (const keys of scanKeys(node, pattern)) count += keys.length;
+            return count;
+        }));
+        return counts.reduce((sum, count) => sum + count, 0);
     }
 
     buildCacheKey(...parts: string[]): string {
@@ -108,7 +125,20 @@ export class RedisCacheService implements ICacheService {
         return this.ttl[type] ?? 0;
     }
 
-    getRedisClient(): Redis {
+    getRedisClient(): TClient {
         return this.redis;
     }
+
+    private scanNodes(): RedisClientLike[] {
+        return this.redis.nodes ? this.redis.nodes('master') : [this.redis];
+    }
+}
+
+async function* scanKeys(node: RedisClientLike, pattern: string): AsyncGenerator<string[]> {
+    let cursor = '0';
+    do {
+        const [next, keys] = await node.scan(cursor, 'MATCH', pattern, 'COUNT', SCAN_BATCH);
+        cursor = next;
+        yield keys;
+    } while (cursor !== '0');
 }

@@ -1,3 +1,3 @@
-export * from './event';
-export * from './config';
-export * from './snapshot';
+export * from './event.js';
+export * from './config.js';
+export * from './snapshot.js';

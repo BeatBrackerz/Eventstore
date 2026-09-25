@@ -1,21 +1,31 @@
-import {SupabaseClient} from "@supabase/supabase-js";
-import {Redis} from "ioredis";
+import type {SupabaseClient} from "@supabase/supabase-js";
 import {
     CacheConfig,
     CreateEventInput, CreateSnapshotInput,
     EventProjection,
     EventRecord,
     EventStoreError,
-    QueryEventsOptions, ReplayOptions, SnapshotRecord
-} from "../domain";
+    QueryEventsOptions, RedisClientLike, ReplayOptions, SnapshotRecord
+} from "../domain/index.js";
 import {
+    MemoryCacheService,
     NoOpCacheService,
     RedisCacheService,
     SupabaseEventPublisher,
     SupabaseEventRepository, SupabaseSequenceRepository,
     SupabaseSnapshotRepository
-} from "../adapters";
-import {ICacheService, IEventPublisher, IEventRepository, ISequenceRepository, ISnapshotRepository} from "../ports";
+} from "../adapters/index.js";
+import type {
+    AggregateStatsData,
+    ICacheService,
+    IEventPublisher,
+    IEventRepository,
+    ISequenceRepository,
+    ISnapshotRepository,
+    LoadedStream
+} from "../ports/index.js";
+import {AggregateCache, type AggregateRef, type Freshness, lastSequence, sliceStream, type StreamEntry} from "./AggregateCache.js";
+import {cloneJson, SingleFlight} from "./SingleFlight.js";
 
 /**
  * Event Store Service Configuration
@@ -26,13 +36,19 @@ export interface EventStoreConfig {
     snapshotRepository: ISnapshotRepository;
     cacheService: ICacheService;
     eventPublisher?: IEventPublisher;
+    cache?: CacheConfig; // TTLs, key prefix and consistency of the cache
 }
 
 /**
  * Event Store Service - Core Business Logic
  */
 export class EventStore {
-    constructor(private readonly config: EventStoreConfig) {}
+    private readonly cache: AggregateCache;
+    private readonly flights = new SingleFlight();
+
+    constructor(private readonly config: EventStoreConfig) {
+        this.cache = new AggregateCache(config.cacheService, config.cache);
+    }
 
     // ============================================================================
     // EVENT OPERATIONS
@@ -43,14 +59,20 @@ export class EventStore {
      */
     async appendEvent(event: CreateEventInput): Promise<EventRecord> {
         try {
-            const sequenceNumber = await this.config.sequenceRepository.getNextSequence(
-                event.aggregate_id,
-                event.aggregate_type
-            );
+            const appended = await this.config.eventRepository.appendEvents?.([event]);
+            let savedEvent: EventRecord;
 
-            const savedEvent = await this.config.eventRepository.saveEvent(event, sequenceNumber);
+            if (appended) {
+                savedEvent = appended[0];
+            } else {
+                const sequenceNumber = await this.config.sequenceRepository.getNextSequence(
+                    event.aggregate_id,
+                    event.aggregate_type
+                );
+                savedEvent = await this.config.eventRepository.saveEvent(event, sequenceNumber);
+            }
 
-            await this.invalidateAggregateCache(event.aggregate_id, event.aggregate_type);
+            await this.cache.afterAppend([savedEvent]);
 
             return savedEvent;
         } catch (err) {
@@ -66,29 +88,14 @@ export class EventStore {
         if (events.length === 0) return [];
 
         try {
-            const eventsByAggregate = this.groupEventsByAggregate(events);
-            const sequenceMap = await this.reserveSequences(eventsByAggregate);
+            let savedEvents = await this.config.eventRepository.appendEvents?.(events);
 
-            const eventsWithSequences = events.map(event => {
-                const key = this.aggregateKey(event.aggregate_id, event.aggregate_type);
-                const groupEvents = eventsByAggregate.get(key)!;
-                const indexInGroup = groupEvents.indexOf(event);
-                const startSequence = sequenceMap.get(key)!;
+            if (!savedEvents) {
+                const eventsWithSequences = await this.reserveSequences(events);
+                savedEvents = await this.config.eventRepository.saveEvents(eventsWithSequences);
+            }
 
-                return {
-                    event,
-                    sequenceNumber: startSequence + indexInGroup,
-                };
-            });
-
-            const savedEvents = await this.config.eventRepository.saveEvents(eventsWithSequences);
-
-            await Promise.all(
-                Array.from(eventsByAggregate.keys()).map(key => {
-                    const [aggregateId, aggregateType] = key.split(':');
-                    return this.invalidateAggregateCache(aggregateId, aggregateType);
-                })
-            );
+            await this.cache.afterAppend(savedEvents);
 
             return savedEvents;
         } catch (err) {
@@ -118,23 +125,7 @@ export class EventStore {
         fromSequence?: number
     ): Promise<EventRecord[]> {
         try {
-            const cacheKey = this.buildCacheKey('agg', aggregateType, aggregateId, fromSequence?.toString() ?? 'all');
-
-            const cached = await this.config.cacheService.get<EventRecord[]>(cacheKey);
-            if (cached) return cached;
-
-            const events = await this.config.eventRepository.findEventsByAggregate(
-                aggregateId,
-                aggregateType,
-                fromSequence
-            );
-
-            const ttl = this.getCacheTTL('aggregateEvents');
-            if (ttl > 0) {
-                await this.config.cacheService.set(cacheKey, events, ttl);
-            }
-
-            return events;
+            return await this.readEvents({ aggregateId, aggregateType }, fromSequence ?? 1, undefined, 'read');
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to get aggregate events', err);
@@ -142,7 +133,7 @@ export class EventStore {
     }
 
     /**
-     * Get events by type
+     * Get events by type, most recent first
      */
     async getEventsByType(type: string, limit?: number): Promise<EventRecord[]> {
         try {
@@ -176,19 +167,20 @@ export class EventStore {
         aggregateType: string
     ): Promise<number> {
         try {
-            const cacheKey = this.buildCacheKey('seq', aggregateType, aggregateId);
+            const ref = { aggregateId, aggregateType };
 
-            const cached = await this.config.cacheService.get<number>(cacheKey);
-            if (cached !== null) return cached;
+            if (this.cache.cachesDerivedValues) {
+                const cached = await this.cache.getSequence(ref);
+                if (cached !== null) return cached;
+            }
 
             const sequence = await this.config.sequenceRepository.getCurrentSequence(
                 aggregateId,
                 aggregateType
             );
 
-            const ttl = this.getCacheTTL('sequences');
-            if (ttl > 0) {
-                await this.config.cacheService.set(cacheKey, sequence, ttl);
+            if (this.cache.cachesDerivedValues) {
+                await this.cache.putSequence(ref, sequence);
             }
 
             return sequence;
@@ -222,17 +214,10 @@ export class EventStore {
         try {
             const saved = await this.config.snapshotRepository.saveSnapshot(snapshot);
 
-            const cacheKey = this.buildCacheKey(
-                'snapshot',
-                snapshot.aggregate_type,
-                snapshot.aggregate_id,
-                'latest'
+            await this.cache.offerHead(
+                { aggregateId: snapshot.aggregate_id, aggregateType: snapshot.aggregate_type },
+                saved
             );
-
-            const ttl = this.getCacheTTL('snapshots');
-            if (ttl > 0) {
-                await this.config.cacheService.set(cacheKey, saved, ttl);
-            }
 
             return saved;
         } catch (err) {
@@ -249,24 +234,13 @@ export class EventStore {
         aggregateType: string
     ): Promise<SnapshotRecord | null> {
         try {
-            const cacheKey = this.buildCacheKey('snapshot', aggregateType, aggregateId, 'latest');
+            const ref = { aggregateId, aggregateType };
 
-            const cached = await this.config.cacheService.get<SnapshotRecord>(cacheKey);
-            if (cached) return cached;
-
-            const snapshot = await this.config.snapshotRepository.findLatestSnapshot(
-                aggregateId,
-                aggregateType
-            );
-
-            if (snapshot) {
-                const ttl = this.getCacheTTL('snapshots');
-                if (ttl > 0) {
-                    await this.config.cacheService.set(cacheKey, snapshot, ttl);
-                }
+            if (!this.cache.enabled) {
+                return await this.config.snapshotRepository.findLatestSnapshot(aggregateId, aggregateType);
             }
 
-            return snapshot;
+            return await this.flights.run(`head|${this.cache.headKey(ref)}`, () => this.syncHead(ref));
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to get latest snapshot', err);
@@ -302,11 +276,17 @@ export class EventStore {
         keepCount: number = 3
     ): Promise<number> {
         try {
-            return await this.config.snapshotRepository.deleteOldSnapshots(
+            const deleted = await this.config.snapshotRepository.deleteOldSnapshots(
                 aggregateId,
                 aggregateType,
                 keepCount
             );
+
+            if (deleted > 0) {
+                await this.cache.dropHead({ aggregateId, aggregateType });
+            }
+
+            return deleted;
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to prune snapshots', err);
@@ -327,24 +307,17 @@ export class EventStore {
         options: ReplayOptions = {}
     ): Promise<T> {
         try {
+            const ref = { aggregateId, aggregateType };
             let state = projection.initialState;
-            let fromSequence = options.from_sequence ?? 1;
+            let events: EventRecord[];
 
-            if (!options.from_sequence) {
-                const snapshot = await this.getLatestSnapshot(aggregateId, aggregateType);
-                if (snapshot) {
-                    state = snapshot.state;
-                    fromSequence = snapshot.sequence_number + 1;
-                }
+            if (options.from_sequence) {
+                events = await this.readEvents(ref, options.from_sequence, options.to_sequence, 'replay');
+            } else {
+                const source = await this.loadReplaySource(ref, options.to_sequence);
+                if (source.snapshot) state = source.snapshot.state;
+                events = source.events;
             }
-
-            const events = await this.queryEvents({
-                aggregate_id: aggregateId,
-                aggregate_type: aggregateType,
-                from_sequence: fromSequence,
-                to_sequence: options.to_sequence,
-                order: 'asc',
-            });
 
             for (const event of events) {
                 state = projection.applyEvent(state, event);
@@ -366,28 +339,40 @@ export class EventStore {
         batchSize: number = 100
     ): Promise<void> {
         try {
+            const repository = this.config.eventRepository;
+            const singleAggregate = options.aggregate_id !== undefined && options.aggregate_type !== undefined;
             let batchNumber = 0;
-            let hasMore = true;
-            let lastSequence = options.from_sequence ?? 0;
 
-            while (hasMore) {
+            if (!singleAggregate && repository.findEventsPage) {
+                // Sequence numbers are per aggregate, so streams across aggregates are paged in global order
+                for (let offset = 0; ;) {
+                    const events = await repository.findEventsPage(options, offset, batchSize);
+                    if (events.length === 0) break;
+
+                    await batchCallback(events, batchNumber++);
+
+                    offset += events.length;
+                    if (events.length < batchSize) break;
+                }
+                return;
+            }
+
+            let nextSequence = options.from_sequence ?? 1;
+
+            for (;;) {
                 const events = await this.queryEvents({
                     ...options,
-                    from_sequence: lastSequence + 1,
+                    from_sequence: nextSequence,
                     limit: batchSize,
                     order: 'asc',
                 });
 
                 if (events.length === 0) break;
 
-                await batchCallback(events, batchNumber);
+                await batchCallback(events, batchNumber++);
 
-                lastSequence = events[events.length - 1].sequence_number;
-                batchNumber++;
-
-                if (events.length < batchSize) {
-                    hasMore = false;
-                }
+                nextSequence = events[events.length - 1].sequence_number + 1;
+                if (events.length < batchSize) break;
             }
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
@@ -405,46 +390,29 @@ export class EventStore {
         snapshotInterval: number = 50
     ): Promise<T> {
         try {
-            let state = projection.initialState;
-            let lastSnapshotSequence = 0;
-
-            const snapshot = await this.getLatestSnapshot(aggregateId, aggregateType);
-            if (snapshot) {
-                state = snapshot.state;
-                lastSnapshotSequence = snapshot.sequence_number;
-            }
-
-            const events = await this.queryEvents({
-                aggregate_id: aggregateId,
-                aggregate_type: aggregateType,
-                from_sequence: lastSnapshotSequence + 1,
-                order: 'asc',
-            });
+            const ref = { aggregateId, aggregateType };
+            const { snapshot, events } = await this.loadReplaySource(ref);
+            let state = snapshot ? snapshot.state : projection.initialState;
+            const snapshots: CreateSnapshotInput[] = [];
 
             for (let i = 0; i < events.length; i++) {
                 const event = events[i];
                 state = projection.applyEvent(state, event);
 
-                if ((i + 1) % snapshotInterval === 0) {
-                    await this.createSnapshot({
+                const isLast = i === events.length - 1;
+                if (isLast || (snapshotInterval > 0 && (i + 1) % snapshotInterval === 0)) {
+                    snapshots.push({
                         aggregate_id: aggregateId,
                         aggregate_type: aggregateType,
                         sequence_number: event.sequence_number,
-                        state: state,
+                        // Projections may mutate state in place, so intermediate states are copied
+                        state: isLast ? state : cloneJson(state),
                     });
                 }
             }
 
-            if (events.length > 0) {
-                const lastEvent = events[events.length - 1];
-                if (lastEvent.sequence_number > lastSnapshotSequence) {
-                    await this.createSnapshot({
-                        aggregate_id: aggregateId,
-                        aggregate_type: aggregateType,
-                        sequence_number: lastEvent.sequence_number,
-                        state: state,
-                    });
-                }
+            if (snapshots.length > 0) {
+                await this.saveSnapshots(ref, snapshots);
             }
 
             return state;
@@ -481,42 +449,8 @@ export class EventStore {
         eventTypes: Map<string, number>;
     }> {
         try {
-            const cacheKey = this.buildCacheKey('stats', aggregateType, aggregateId);
-
-            const cached = await this.config.cacheService.get<{
-                totalEvents: number;
-                firstEvent: EventRecord | null;
-                lastEvent: EventRecord | null;
-                eventTypes: Array<[string, number]>;
-            }>(cacheKey);
-
-            if (cached) {
-                return {
-                    totalEvents: cached.totalEvents,
-                    firstEvent: cached.firstEvent,
-                    lastEvent: cached.lastEvent,
-                    eventTypes: new Map(cached.eventTypes),
-                };
-            }
-
-            const events = await this.getAggregateEvents(aggregateId, aggregateType);
-
-            const eventTypes = new Map<string, number>();
-            events.forEach(event => {
-                eventTypes.set(event.type, (eventTypes.get(event.type) ?? 0) + 1);
-            });
-
-            const stats = {
-                totalEvents: events.length,
-                firstEvent: events[0] ?? null,
-                lastEvent: events[events.length - 1] ?? null,
-                eventTypes: Array.from(eventTypes.entries()),
-            };
-
-            const ttl = this.getCacheTTL('aggregateEvents');
-            if (ttl > 0) {
-                await this.config.cacheService.set(cacheKey, stats, ttl);
-            }
+            const ref = { aggregateId, aggregateType };
+            const stats = await this.flights.run(`stats|${this.cache.statsKey(ref)}`, () => this.loadStats(ref));
 
             return {
                 totalEvents: stats.totalEvents,
@@ -541,7 +475,7 @@ export class EventStore {
         issues: string[];
     }> {
         try {
-            const events = await this.getAggregateEvents(aggregateId, aggregateType);
+            const events = await this.readEvents({ aggregateId, aggregateType }, 1, undefined, 'read');
             const issues: string[] = [];
 
             if (events.length === 0) {
@@ -584,8 +518,7 @@ export class EventStore {
      */
     async clearCache(): Promise<void> {
         try {
-            const pattern = this.buildCacheKey('*');
-            await this.config.cacheService.deletePattern(pattern);
+            await this.cache.clear();
         } catch (err) {
             console.error('Failed to clear cache:', err);
         }
@@ -595,7 +528,7 @@ export class EventStore {
      * Clear cache for specific aggregate
      */
     async clearAggregateCache(aggregateId: string, aggregateType: string): Promise<void> {
-        await this.invalidateAggregateCache(aggregateId, aggregateType);
+        await this.cache.dropAggregate({ aggregateId, aggregateType });
     }
 
     /**
@@ -625,6 +558,7 @@ export class EventStore {
             memory: string;
         };
     }> {
+        const service = this.config.cacheService;
         const stats: {
             enabled: boolean;
             type: string;
@@ -633,20 +567,23 @@ export class EventStore {
                 memory: string;
             };
         } = {
-            enabled: !(this.config.cacheService instanceof NoOpCacheService),
-            type: this.config.cacheService.constructor.name,
+            enabled: this.cache.enabled,
+            type: service.constructor.name,
         };
 
-        if (this.config.cacheService instanceof RedisCacheService) {
+        if (service instanceof MemoryCacheService) {
+            stats.info = {
+                keys: service.size,
+                memory: formatBytes(service.sizeBytes),
+            };
+        } else if (service instanceof RedisCacheService) {
             try {
-                const redis = this.config.cacheService.getRedisClient();
-                const pattern = this.buildCacheKey('*');
-                const keys = await redis.keys(pattern);
-                const info = await redis.info('memory');
+                const keys = await service.countKeys(this.cache.pattern());
+                const info = await service.getRedisClient().info?.('memory') ?? '';
                 const memoryMatch = info.match(/used_memory_human:([^\r\n]+)/);
 
                 stats.info = {
-                    keys: keys.length,
+                    keys,
                     memory: memoryMatch ? memoryMatch[1] : 'unknown',
                 };
             } catch (err) {
@@ -662,83 +599,290 @@ export class EventStore {
     // ============================================================================
 
     /**
-     * Build cache key with proper prefix
+     * Events of an aggregate within [from, to], served from the stream cache where possible
      */
-    private buildCacheKey(...parts: string[]): string {
-        if (this.config.cacheService instanceof RedisCacheService) {
-            return this.config.cacheService.buildCacheKey(...parts);
+    private async readEvents(
+        ref: AggregateRef,
+        from: number,
+        to: number | undefined,
+        freshness: Freshness
+    ): Promise<EventRecord[]> {
+        if (to !== undefined && to < from) return [];
+
+        const key = `events|${this.cache.streamKey(ref)}|${from}|${to ?? ''}|${freshness}`;
+
+        if (!this.cache.enabled) {
+            return this.flights.run(key, () => this.loadEvents(ref, from, to));
         }
-        return parts.join(':');
+
+        return this.flights.run(key, async () => {
+            const entry = await this.syncStream(ref, from, to, freshness);
+            return sliceStream(entry, from, to);
+        });
     }
 
     /**
-     * Get cache TTL for a specific type
+     * Make sure the cached stream covers [from, to] and is recent enough.
+     * Only missing parts are loaded: a prefix before the cached range and/or new events after it.
      */
-    private getCacheTTL(type: 'events' | 'snapshots' | 'sequences' | 'aggregateEvents'): number {
-        if (this.config.cacheService instanceof RedisCacheService) {
-            return this.config.cacheService.getTTL(type);
+    private async syncStream(
+        ref: AggregateRef,
+        from: number,
+        to: number | undefined,
+        freshness: Freshness
+    ): Promise<StreamEntry> {
+        const key = this.cache.streamKey(ref);
+        const generation = this.cache.generation(ref);
+        const cached = await this.cache.getStream(ref);
+
+        if (!cached) {
+            const events = await this.loadEvents(ref, from, to);
+            const entry = { from, to: lastSequence(events, from - 1), events };
+            if (to === undefined) this.cache.markSynced(key);
+            await this.cache.putStream(ref, entry, generation);
+            return entry;
         }
-        return 0;
+
+        const needsPrefix = from < cached.from;
+        const needsDelta = (to === undefined || to > cached.to) && !this.cache.isFresh(key, freshness);
+        if (!needsPrefix && !needsDelta) return cached;
+
+        const [prefix, delta] = await Promise.all([
+            needsPrefix ? this.loadEvents(ref, from, cached.from - 1) : undefined,
+            needsDelta ? this.fetchEvents(ref, cached.to + 1, undefined) : undefined,
+        ]);
+
+        let entry = cached;
+        if (prefix) {
+            entry = { from, to: cached.to, events: [...prefix, ...cached.events] };
+        }
+        if (delta) {
+            this.cache.markSynced(key);
+            for (const event of delta) entry.events.push(event);
+            entry.to = lastSequence(delta, entry.to);
+        }
+
+        if (prefix || delta?.length) {
+            await this.cache.putStream(ref, entry, generation);
+        }
+
+        return entry;
     }
 
     /**
-     * Group events by aggregate
+     * Latest snapshot plus the events after it (up to `to`), for state reconstruction
      */
-    private groupEventsByAggregate(events: CreateEventInput[]): Map<string, CreateEventInput[]> {
-        const map = new Map<string, CreateEventInput[]>();
+    private async loadReplaySource(ref: AggregateRef, to?: number): Promise<LoadedStream> {
+        return this.flights.run(`replay|${this.cache.streamKey(ref)}|${to ?? ''}`, async () => {
+            const head = await this.cache.getHead(ref);
 
-        for (const event of events) {
-            const key = this.aggregateKey(event.aggregate_id, event.aggregate_type);
-            const group = map.get(key) ?? [];
-            group.push(event);
-            map.set(key, group);
-        }
+            if (!head) {
+                const generation = this.cache.generation(ref);
+                const loaded = await this.fetchReplaySource(ref, to);
 
-        return map;
+                if (this.cache.enabled) {
+                    const from = loaded.snapshot ? loaded.snapshot.sequence_number + 1 : 1;
+                    if (to === undefined) await this.cache.putHead(ref, loaded.snapshot);
+                    await this.cache.mergeStream(
+                        ref,
+                        { from, to: lastSequence(loaded.events, from - 1), events: loaded.events },
+                        generation,
+                        to === undefined
+                    );
+                }
+
+                return loaded;
+            }
+
+            // Any snapshot is a valid starting point, so the cached one is used without checking for newer ones
+            let snapshot = head.snapshot;
+            if (snapshot && to !== undefined && snapshot.sequence_number > to) {
+                snapshot = await this.config.snapshotRepository.findSnapshotAtSequence(ref.aggregateId, ref.aggregateType, to);
+            }
+
+            const from = snapshot ? snapshot.sequence_number + 1 : 1;
+            const entry = await this.syncStream(ref, from, to, 'replay');
+
+            return { snapshot, events: sliceStream(entry, from, to) };
+        });
     }
 
     /**
-     * Reserve sequence numbers for multiple aggregates
+     * Load snapshot and events from the database: one round trip with the database function, two without
+     */
+    private async fetchReplaySource(ref: AggregateRef, to?: number): Promise<LoadedStream> {
+        const loaded = await this.config.eventRepository.loadStream?.({
+            aggregateId: ref.aggregateId,
+            aggregateType: ref.aggregateType,
+            toSequence: to,
+            withSnapshot: true,
+        });
+        if (loaded) return loaded;
+
+        const snapshot = to === undefined
+            ? await this.config.snapshotRepository.findLatestSnapshot(ref.aggregateId, ref.aggregateType)
+            : await this.config.snapshotRepository.findSnapshotAtSequence(ref.aggregateId, ref.aggregateType, to);
+        const from = snapshot ? snapshot.sequence_number + 1 : 1;
+
+        return { snapshot, events: await this.fetchEvents(ref, from, to) };
+    }
+
+    /**
+     * Load a possibly long range of events: one round trip with the database function,
+     * otherwise one request per page
+     */
+    private async loadEvents(ref: AggregateRef, from: number, to: number | undefined): Promise<EventRecord[]> {
+        const loaded = await this.config.eventRepository.loadStream?.({
+            aggregateId: ref.aggregateId,
+            aggregateType: ref.aggregateType,
+            fromSequence: from,
+            toSequence: to,
+        });
+        return loaded ? loaded.events : this.fetchEvents(ref, from, to);
+    }
+
+    private fetchEvents(ref: AggregateRef, from: number, to: number | undefined): Promise<EventRecord[]> {
+        return this.config.eventRepository.findEvents({
+            aggregate_id: ref.aggregateId,
+            aggregate_type: ref.aggregateType,
+            from_sequence: from,
+            to_sequence: to,
+            order: 'asc',
+        });
+    }
+
+    /**
+     * Latest snapshot, checking the database for a newer one unless the cached one is fresh enough
+     */
+    private async syncHead(ref: AggregateRef): Promise<SnapshotRecord | null> {
+        const key = this.cache.headKey(ref);
+        const head = await this.cache.getHead(ref);
+        if (head && this.cache.isFresh(key, 'read')) return head.snapshot;
+
+        const repository = this.config.snapshotRepository;
+        let snapshot: SnapshotRecord | null;
+
+        if (head?.snapshot && repository.findLatestSnapshotAfter) {
+            // Transfers the (possibly large) state only if there is a newer snapshot
+            const newer = await repository.findLatestSnapshotAfter(ref.aggregateId, ref.aggregateType, head.snapshot.sequence_number);
+            snapshot = newer ?? head.snapshot;
+        } else {
+            snapshot = await repository.findLatestSnapshot(ref.aggregateId, ref.aggregateType);
+        }
+
+        this.cache.markSynced(key);
+        if (!head || snapshot !== head.snapshot) {
+            await this.cache.putHead(ref, snapshot);
+        }
+
+        return snapshot;
+    }
+
+    private async loadStats(ref: AggregateRef): Promise<AggregateStatsData> {
+        if (this.cache.cachesDerivedValues) {
+            const cached = await this.cache.getStats(ref);
+            if (cached) return cached;
+        }
+
+        // Prefer a complete cached stream; otherwise let the database aggregate instead of transferring every event
+        const entry = await this.cache.getStream(ref);
+        let stats = entry?.from === 1
+            ? undefined
+            : await this.config.eventRepository.getAggregateStats?.(ref.aggregateId, ref.aggregateType);
+
+        if (!stats) {
+            stats = computeStats(await this.readEvents(ref, 1, undefined, 'read'));
+        }
+
+        if (this.cache.cachesDerivedValues) {
+            await this.cache.putStats(ref, stats);
+        }
+
+        return stats;
+    }
+
+    private async saveSnapshots(ref: AggregateRef, snapshots: CreateSnapshotInput[]): Promise<void> {
+        const repository = this.config.snapshotRepository;
+        let saved: SnapshotRecord[];
+
+        if (repository.saveSnapshots) {
+            saved = await repository.saveSnapshots(snapshots);
+        } else {
+            saved = [];
+            for (const snapshot of snapshots) {
+                saved.push(await repository.saveSnapshot(snapshot));
+            }
+        }
+
+        const latest = saved.reduce<SnapshotRecord | null>(
+            (max, snapshot) => !max || snapshot.sequence_number > max.sequence_number ? snapshot : max,
+            null
+        );
+        if (latest) await this.cache.offerHead(ref, latest);
+    }
+
+    /**
+     * Reserve sequence numbers for multiple aggregates (fallback without atomic append)
      */
     private async reserveSequences(
-        eventsByAggregate: Map<string, CreateEventInput[]>
-    ): Promise<Map<string, number>> {
-        const sequencePromises = Array.from(eventsByAggregate.entries()).map(
-            async ([key, events]) => {
-                const [aggregateId, aggregateType] = key.split(':');
+        events: CreateEventInput[]
+    ): Promise<Array<{ event: CreateEventInput; sequenceNumber: number }>> {
+        const counts = new Map<string, { aggregateId: string; aggregateType: string; count: number }>();
+        for (const event of events) {
+            const key = aggregateKey(event.aggregate_id, event.aggregate_type);
+            const group = counts.get(key) ?? { aggregateId: event.aggregate_id, aggregateType: event.aggregate_type, count: 0 };
+            group.count++;
+            counts.set(key, group);
+        }
+
+        const nextSequence = new Map<string, number>();
+        await Promise.all(
+            Array.from(counts, async ([key, group]) => {
                 const startSequence = await this.config.sequenceRepository.getNextSequence(
-                    aggregateId,
-                    aggregateType,
-                    events.length
+                    group.aggregateId,
+                    group.aggregateType,
+                    group.count
                 );
-                return { key, startSequence };
-            }
+                nextSequence.set(key, startSequence);
+            })
         );
 
-        const sequences = await Promise.all(sequencePromises);
-        return new Map(sequences.map(s => [s.key, s.startSequence]));
+        return events.map(event => {
+            const key = aggregateKey(event.aggregate_id, event.aggregate_type);
+            const sequenceNumber = nextSequence.get(key)!;
+            nextSequence.set(key, sequenceNumber + 1);
+            return { event, sequenceNumber };
+        });
+    }
+}
+
+function aggregateKey(aggregateId: string, aggregateType: string): string {
+    return JSON.stringify([aggregateId, aggregateType]);
+}
+
+function computeStats(events: EventRecord[]): AggregateStatsData {
+    const eventTypes = new Map<string, number>();
+    for (const event of events) {
+        eventTypes.set(event.type, (eventTypes.get(event.type) ?? 0) + 1);
     }
 
-    /**
-     * Invalidate all cache entries for an aggregate
-     */
-    private async invalidateAggregateCache(aggregateId: string, aggregateType: string): Promise<void> {
-        const patterns = [
-            this.buildCacheKey('agg', aggregateType, aggregateId) + '*',
-            this.buildCacheKey('snapshot', aggregateType, aggregateId) + '*',
-            this.buildCacheKey('seq', aggregateType, aggregateId),
-            this.buildCacheKey('stats', aggregateType, aggregateId),
-        ];
+    return {
+        totalEvents: events.length,
+        firstEvent: events[0] ?? null,
+        lastEvent: events[events.length - 1] ?? null,
+        eventTypes: Array.from(eventTypes.entries()),
+    };
+}
 
-        await Promise.all(patterns.map(p => this.config.cacheService.deletePattern(p)));
+function formatBytes(bytes: number): string {
+    const units = ['B', 'K', 'M', 'G'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit++;
     }
-
-    /**
-     * Generate aggregate key
-     */
-    private aggregateKey(aggregateId: string, aggregateType: string): string {
-        return `${aggregateId}:${aggregateType}`;
-    }
+    return `${value.toFixed(2)}${units[unit]}`;
 }
 
 // ============================================================================
@@ -749,23 +893,29 @@ export class EventStore {
  * Event Store Builder Configuration
  */
 export interface EventStoreBuilderConfig {
-    supabase: SupabaseClient;
-    redis?: Redis;
+    supabase: SupabaseClient<any, any, any>;
+    redis?: RedisClientLike; // Shared cache; without it an in-memory cache is used
     cache?: CacheConfig;
     enablePublisher?: boolean;
+    rpc?: boolean | 'auto'; // Use the database functions from sql/eventstore.sql (default: 'auto')
+    pageSize?: number; // Rows per request when paginating, at most PostgREST's max-rows (default: 1000)
 }
 
 /**
  * Factory function to create Event Store with Supabase adapters
  */
 export function createEventStore(config: EventStoreBuilderConfig): EventStore {
-    const eventRepository = new SupabaseEventRepository(config.supabase);
+    const adapterOptions = { rpc: config.rpc ?? 'auto', pageSize: config.pageSize };
+    const eventRepository = new SupabaseEventRepository(config.supabase, adapterOptions);
     const sequenceRepository = new SupabaseSequenceRepository(config.supabase);
-    const snapshotRepository = new SupabaseSnapshotRepository(config.supabase);
+    const snapshotRepository = new SupabaseSnapshotRepository(config.supabase, adapterOptions);
 
-    const cacheService = config.redis
-        ? new RedisCacheService(config.redis, config.cache)
-        : new NoOpCacheService();
+    const redis = config.redis ?? config.cache?.redis;
+    const cacheService = config.cache?.enabled === false
+        ? new NoOpCacheService()
+        : redis
+            ? new RedisCacheService(redis, config.cache)
+            : new MemoryCacheService(config.cache?.memory);
 
     const eventPublisher = config.enablePublisher
         ? new SupabaseEventPublisher(config.supabase)
@@ -777,6 +927,7 @@ export function createEventStore(config: EventStoreBuilderConfig): EventStore {
         snapshotRepository,
         cacheService,
         eventPublisher,
+        cache: config.cache,
     });
 }
 

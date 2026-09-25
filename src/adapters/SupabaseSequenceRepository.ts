@@ -1,14 +1,18 @@
-import {ISequenceRepository} from "../ports";
-import {SupabaseClient} from "@supabase/supabase-js";
-import {EventStoreError} from "../domain";
+import type {ISequenceRepository} from "../ports/index.js";
+import {EventStoreError} from "../domain/index.js";
+import type {AnySupabaseClient} from "./supabaseSupport.js";
 
 /**
  * Adapter: Supabase Sequence Repository
+ *
+ * Fallback used when the `es_append_events` database function is not installed. Reading and
+ * updating the counter are separate requests, so concurrent writers to the same aggregate can
+ * race; the database function allocates sequence numbers atomically instead.
  */
 export class SupabaseSequenceRepository implements ISequenceRepository {
     private readonly tableName = 'aggregate_sequences';
 
-    constructor(private readonly client: SupabaseClient) {}
+    constructor(private readonly client: AnySupabaseClient) {}
 
     async getCurrentSequence(aggregateId: string, aggregateType: string): Promise<number> {
         const { data, error } = await this.client
@@ -16,12 +20,9 @@ export class SupabaseSequenceRepository implements ISequenceRepository {
             .select('last_sequence')
             .eq('aggregate_id', aggregateId)
             .eq('aggregate_type', aggregateType)
-            .single();
+            .maybeSingle();
 
-        if (error && error.code !== 'PGRST116') {
-            throw new EventStoreError(`Failed to get sequence: ${error.message}`, error);
-        }
-
+        if (error) throw new EventStoreError(`Failed to get sequence: ${error.message}`, error);
         return data?.last_sequence ?? 0;
     }
 

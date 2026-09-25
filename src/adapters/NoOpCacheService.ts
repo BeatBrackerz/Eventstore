@@ -1,4 +1,4 @@
-import {ICacheService} from "../ports";
+import type {ICacheService} from "../ports/index.js";
 
 /**
  * Adapter: No-Op Cache Service (for when caching is disabled)
