@@ -1,4 +1,4 @@
-import {EventRecord, QueryEventsOptions} from "../domain";
+import type {EventRecord, QueryEventsOptions} from "../domain/index.js";
 
 /**
  * Port: Event Publisher

@@ -1,28 +1,30 @@
-import { SupabaseClient } from '@supabase/supabase-js';
-import {CreateEventInput, EventRecord, EventStoreError, QueryEventsOptions} from "../domain";
-import {IEventRepository} from "../ports";
+import {CreateEventInput, EventRecord, EventStoreError, QueryEventsOptions} from "../domain/index.js";
+import type {AggregateStatsData, IEventRepository, LoadedStream, StreamQuery} from "../ports/index.js";
+import {type AnySupabaseClient, DEFAULT_PAGE_SIZE, RpcSupport, type SupabaseAdapterOptions} from "./supabaseSupport.js";
+
+type EventFilters = Omit<QueryEventsOptions, 'limit' | 'order'>;
+type SortKey = ['sequence_number' | 'created_at' | 'id', boolean];
+
+// The load function returns one JSON value, so it is not capped by max-rows; page anyway to bound memory
+const RPC_PAGE_SIZE = 10_000;
 
 /**
  * Adapter: Supabase Event Repository
  */
 export class SupabaseEventRepository implements IEventRepository {
     private readonly tableName = 'events';
+    private readonly rpc: RpcSupport;
+    private readonly pageSize: number;
 
-    constructor(private readonly client: SupabaseClient) {}
+    constructor(private readonly client: AnySupabaseClient, options: SupabaseAdapterOptions = {}) {
+        this.rpc = new RpcSupport(client, options.rpc);
+        this.pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
+    }
 
     async saveEvent(event: CreateEventInput, sequenceNumber: number): Promise<EventRecord> {
         const { data, error } = await this.client
             .from(this.tableName)
-            .insert({
-                type: event.type,
-                aggregate_id: event.aggregate_id,
-                aggregate_type: event.aggregate_type,
-                sequence_number: sequenceNumber,
-                version: event.version ?? 1,
-                payload: event.payload ?? {},
-                metadata: event.metadata ?? {},
-                created_by: event.created_by,
-            })
+            .insert({ ...toRow(event), sequence_number: sequenceNumber })
             .select()
             .single();
 
@@ -32,14 +34,8 @@ export class SupabaseEventRepository implements IEventRepository {
 
     async saveEvents(events: Array<{ event: CreateEventInput; sequenceNumber: number }>): Promise<EventRecord[]> {
         const eventsToInsert = events.map(({ event, sequenceNumber }) => ({
-            type: event.type,
-            aggregate_id: event.aggregate_id,
-            aggregate_type: event.aggregate_type,
+            ...toRow(event),
             sequence_number: sequenceNumber,
-            version: event.version ?? 1,
-            payload: event.payload ?? {},
-            metadata: event.metadata ?? {},
-            created_by: event.created_by,
         }));
 
         const { data, error } = await this.client
@@ -51,21 +47,13 @@ export class SupabaseEventRepository implements IEventRepository {
         return data as EventRecord[];
     }
 
+    /**
+     * Find events. Without `limit` all matching events are returned; results larger than
+     * PostgREST's max-rows are fetched page by page instead of being silently truncated.
+     */
     async findEvents(options: QueryEventsOptions): Promise<EventRecord[]> {
-        let query = this.client.from(this.tableName).select('*');
-
-        if (options.aggregate_id) query = query.eq('aggregate_id', options.aggregate_id);
-        if (options.aggregate_type) query = query.eq('aggregate_type', options.aggregate_type);
-        if (options.type) query = query.eq('type', options.type);
-        if (options.from_sequence !== undefined) query = query.gte('sequence_number', options.from_sequence);
-        if (options.to_sequence !== undefined) query = query.lte('sequence_number', options.to_sequence);
-
-        query = query.order('sequence_number', { ascending: options.order !== 'desc' });
-        if (options.limit) query = query.limit(options.limit);
-
-        const { data, error } = await query;
-        if (error) throw new EventStoreError(`Failed to find events: ${error.message}`, error);
-        return (data as EventRecord[]) ?? [];
+        const ascending = options.order !== 'desc';
+        return this.fetchPages(options, [['sequence_number', ascending], ['id', ascending]], 0, options.limit || undefined);
     }
 
     async findEventsByAggregate(aggregateId: string, aggregateType: string, fromSequence?: number): Promise<EventRecord[]> {
@@ -77,8 +65,11 @@ export class SupabaseEventRepository implements IEventRepository {
         });
     }
 
+    /**
+     * Most recent events of a type first
+     */
     async findEventsByType(type: string, limit?: number): Promise<EventRecord[]> {
-        return this.findEvents({ type, limit, order: 'desc' });
+        return this.fetchPages({ type }, [['created_at', false], ['sequence_number', false], ['id', false]], 0, limit || undefined);
     }
 
     async findLatestEvent(aggregateId: string, aggregateType: string): Promise<EventRecord | null> {
@@ -90,4 +81,96 @@ export class SupabaseEventRepository implements IEventRepository {
         });
         return events[0] ?? null;
     }
+
+    async findEventsPage(options: EventFilters, offset: number, limit: number): Promise<EventRecord[]> {
+        return this.fetchPages(options, [['created_at', true], ['sequence_number', true], ['id', true]], offset, limit);
+    }
+
+    /**
+     * Atomic append in one round trip (requires `es_append_events`)
+     */
+    async appendEvents(events: CreateEventInput[]): Promise<EventRecord[] | undefined> {
+        return this.rpc.call<EventRecord[]>('es_append_events', { p_events: events.map(toRow) });
+    }
+
+    /**
+     * Snapshot and events in one round trip (requires `es_load_stream`)
+     */
+    async loadStream(query: StreamQuery): Promise<LoadedStream | undefined> {
+        const args = {
+            p_aggregate_id: query.aggregateId,
+            p_aggregate_type: query.aggregateType,
+            p_to_sequence: query.toSequence ?? null,
+            p_limit: RPC_PAGE_SIZE,
+        };
+
+        const first = await this.rpc.call<LoadedStream>('es_load_stream', {
+            ...args,
+            p_from_sequence: query.fromSequence ?? 1,
+            p_use_snapshot: query.withSnapshot ?? false,
+        });
+        if (!first) return undefined;
+
+        const events = first.events;
+        let page = events;
+        while (page.length === RPC_PAGE_SIZE) {
+            const next = await this.rpc.call<LoadedStream>('es_load_stream', {
+                ...args,
+                p_from_sequence: page[page.length - 1].sequence_number + 1,
+                p_use_snapshot: false,
+            });
+            if (!next) throw new EventStoreError('Failed to load stream: es_load_stream became unavailable while paging');
+            page = next.events;
+            for (const event of page) events.push(event);
+        }
+
+        return { snapshot: first.snapshot ?? null, events };
+    }
+
+    /**
+     * Statistics computed in the database (requires `es_aggregate_stats`)
+     */
+    async getAggregateStats(aggregateId: string, aggregateType: string): Promise<AggregateStatsData | undefined> {
+        return this.rpc.call<AggregateStatsData>('es_aggregate_stats', {
+            p_aggregate_id: aggregateId,
+            p_aggregate_type: aggregateType,
+        });
+    }
+
+    private async fetchPages(filters: EventFilters, sort: SortKey[], offset: number, limit?: number): Promise<EventRecord[]> {
+        const rows: EventRecord[] = [];
+
+        for (;;) {
+            const pageSize = limit === undefined ? this.pageSize : Math.min(this.pageSize, limit - rows.length);
+
+            let query = this.client.from(this.tableName).select('*');
+            if (filters.aggregate_id) query = query.eq('aggregate_id', filters.aggregate_id);
+            if (filters.aggregate_type) query = query.eq('aggregate_type', filters.aggregate_type);
+            if (filters.type) query = query.eq('type', filters.type);
+            if (filters.from_sequence !== undefined) query = query.gte('sequence_number', filters.from_sequence);
+            if (filters.to_sequence !== undefined) query = query.lte('sequence_number', filters.to_sequence);
+            for (const [column, ascending] of sort) query = query.order(column, { ascending });
+
+            const { data, error } = await query.range(offset, offset + pageSize - 1);
+            if (error) throw new EventStoreError(`Failed to find events: ${error.message}`, error);
+
+            const page = (data ?? []) as EventRecord[];
+            for (const row of page) rows.push(row);
+            offset += page.length;
+
+            if (page.length < pageSize || rows.length === limit) return rows;
+        }
+    }
+}
+
+function toRow(event: CreateEventInput) {
+    return {
+        type: event.type,
+        aggregate_id: event.aggregate_id,
+        aggregate_type: event.aggregate_type,
+        version: event.version ?? 1,
+        payload: event.payload ?? {},
+        metadata: event.metadata ?? {},
+        created_by: event.created_by,
+    };
 }

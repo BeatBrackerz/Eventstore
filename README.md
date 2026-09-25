@@ -1,6 +1,6 @@
 # Event Store
 
-A production-ready, high-performance Event Sourcing library for Supabase with Redis caching support. Built with TypeScript and following the Ports & Adapters (Hexagonal) architecture pattern.
+A production-ready, high-performance Event Sourcing library for Supabase with built-in caching (in-memory by default, Redis optional). Built with TypeScript and following the Ports & Adapters (Hexagonal) architecture pattern.
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -22,10 +22,11 @@ A production-ready, high-performance Event Sourcing library for Supabase with Re
 - 🔴 Real-time event subscriptions
 
 ⚡ **Performance**
-- 🎯 Redis caching (optional) with 95-99% latency reduction
-- 🔢 Batch operations with automatic sequence reservation
-- 📦 Pipeline-based cache operations
-- 🎨 Configurable TTL per cache type
+- 🧠 In-memory cache out of the box – no Redis required
+- 🔁 Incremental loading: cached aggregates only fetch events they have not seen yet
+- 🎯 Optional database functions: appends and aggregate loads in a single round trip
+- 🤝 Concurrent identical reads share one database request
+- 🔴 Redis (optional) as a shared cache for several instances
 
 🏗️ **Architecture**
 - 🔌 Ports & Adapters (Hexagonal Architecture)
@@ -36,64 +37,26 @@ A production-ready, high-performance Event Sourcing library for Supabase with Re
 ## Installation
 
 ```bash
-npm install @beatbrackerz/eventstore
+npm install @beatbrackerz/eventstore @supabase/supabase-js
 ```
 
-### Peer Dependencies
-
-```bash
-npm install @supabase/supabase-js ioredis
-```
+`@supabase/supabase-js` (≥ 2.91) is a peer dependency. For a cache shared between several instances, also install `ioredis` (optional). Requires Node.js 22 or newer.
 
 ## Quick Start
 
 ### 1. Database Setup
 
-Create the required tables in your Supabase database:
+Run [`sql/eventstore.sql`](sql/eventstore.sql) in the Supabase SQL editor, with `psql`, or as a migration (`supabase migration new eventstore`). The file is also shipped in the package: `node_modules/@beatbrackerz/eventstore/sql/eventstore.sql`.
 
-```sql
--- Events table
-CREATE TABLE public.events (
-  id UUID NOT NULL DEFAULT extensions.uuid_generate_v4(),
-  type VARCHAR(255) NOT NULL,
-  aggregate_id UUID NOT NULL,
-  aggregate_type VARCHAR(255) NOT NULL,
-  sequence_number INTEGER NOT NULL,
-  version INTEGER NOT NULL DEFAULT 1,
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  created_by UUID NOT NULL,
-  CONSTRAINT events_pkey PRIMARY KEY (id)
-);
+It creates
 
-CREATE INDEX idx_events_aggregate_id ON public.events USING btree (aggregate_id);
-CREATE INDEX idx_events_aggregate_type ON public.events USING btree (aggregate_type);
-CREATE INDEX idx_events_type ON public.events USING btree (type);
+- the tables `events`, `aggregate_sequences` and `snapshots` (only if they do not exist yet),
+- the indexes the library's queries need, including a unique index on `(aggregate_id, aggregate_type, sequence_number)`,
+- three database functions: `es_append_events`, `es_load_stream` and `es_aggregate_stats`.
 
--- Sequence management table
-CREATE TABLE public.aggregate_sequences (
-  aggregate_id UUID NOT NULL,
-  aggregate_type VARCHAR(255) NOT NULL,
-  last_sequence INTEGER NOT NULL DEFAULT 0,
-  CONSTRAINT aggregate_sequences_pkey PRIMARY KEY (aggregate_id, aggregate_type)
-);
+The script is safe to run on existing installations and safe to run again. The functions run with the caller's privileges, so grants and row level security apply as for direct table access.
 
--- Snapshots table
-CREATE TABLE public.snapshots (
-  id UUID NOT NULL DEFAULT extensions.uuid_generate_v4(),
-  aggregate_id UUID NOT NULL,
-  aggregate_type VARCHAR(255) NOT NULL,
-  sequence_number INTEGER NOT NULL,
-  state JSONB NOT NULL,
-  version INTEGER NOT NULL DEFAULT 1,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  CONSTRAINT snapshots_pkey PRIMARY KEY (id)
-);
-
-CREATE INDEX idx_snapshots_aggregate ON public.snapshots 
-  USING btree (aggregate_id, aggregate_type, sequence_number DESC);
-```
+**Existing installations:** the library keeps working without the script, but is considerably slower (see [Performance](#performance)) and allocates sequence numbers without locking, so concurrent appends to the same aggregate can produce duplicate sequence numbers. The library detects the functions automatically; no code change is needed after running the script. If your `events` table already contains duplicate sequence numbers, the script creates a non-unique index instead and prints a warning with a query to find them.
 
 ### 2. Basic Usage
 
@@ -107,7 +70,7 @@ const supabase = createClient(
   'your-anon-key'
 );
 
-// Create event store (without cache)
+// Create event store (uses the built-in in-memory cache)
 const eventStore = createEventStore({
   supabase,
   enablePublisher: true,
@@ -135,8 +98,10 @@ console.log('Event created:', event);
 
 ### 3. With Redis Cache
 
+A Redis cache is shared by all instances of your application. Without it, each instance keeps its own in-memory cache (see [Caching & Consistency](#caching--consistency)).
+
 ```typescript
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 
 // Initialize Redis client
 const redis = new Redis({
@@ -231,6 +196,7 @@ const events = await eventStore.queryEvents({
 #### Get Events by Type
 
 ```typescript
+// Most recent events first
 const recentOrders = await eventStore.getEventsByType(
   'OrderCreated',
   10 // limit
@@ -516,6 +482,9 @@ class MemcachedCacheService implements ICacheService {
   // ... implement other methods
 }
 
+// Optional fast paths such as IEventRepository.appendEvents or loadStream can be
+// implemented as well; without them the EventStore falls back to the required methods.
+
 // Create event store with custom adapters
 const customEventStore = new EventStore({
   eventRepository: new MongoDBEventRepository(mongoClient),
@@ -530,7 +499,7 @@ const customEventStore = new EventStore({
 The Ports & Adapters architecture makes testing easy:
 
 ```typescript
-import { EventStore, IEventRepository } from '@beatbrackerz/eventstore';
+import { EventStore, IEventRepository, NoOpCacheService } from '@beatbrackerz/eventstore';
 
 // Mock repository for testing
 class MockEventRepository implements IEventRepository {
@@ -583,17 +552,22 @@ describe('EventStore', () => {
 
 ## Performance
 
-### Without Cache
-- Aggregate Events: ~50-200ms (Database query)
-- Snapshots: ~30-100ms
-- Stats: ~100-300ms
+Measured with [`bench/run.ts`](bench/run.ts) against a real PostgREST (as used by Supabase) with 20 ms of simulated network latency per request. Times are per operation.
 
-### With Redis Cache
-- Aggregate Events: ~1-5ms (Cache hit)
-- Snapshots: ~1-3ms
-- Stats: ~1-3ms
+| Operation | 1.1.1 | 1.2, without SQL script | 1.2, with SQL script | 1.2, with SQL script and `maxStalenessMs: 2000` |
+|---|---:|---:|---:|---:|
+| Append one event | 75 ms · 3 requests | 76 ms · 3 requests | **27 ms · 1 request** | **27 ms · 1 request** |
+| Load an aggregate (replay, snapshot + 10 events), first time | 50 ms · 2 requests | 54 ms · 2 requests | **27 ms · 1 request** | **26 ms · 1 request** |
+| Load the same aggregate again | 50 ms · 2 requests · 5.3 KB | **25 ms · 1 request · 0 KB** | **24 ms · 1 request · 0 KB** | **< 0.1 ms · no request** |
+| Read 60 events of an aggregate again | 25 ms · 30 KB | 25 ms · 0 KB | 24 ms · 0 KB | **< 0.1 ms · no request** |
+| 10 concurrent reads of the same aggregate | 10 requests · 304 KB | **1 request · 30 KB** | **1 request · 30 KB** | **1 request · 30 KB** |
+| Statistics of an aggregate with 2,500 events | wrong result¹ | 149 ms · 5 requests² | **31 ms · 1 request · 34 KB** | **30 ms · 1 request · 34 KB** |
+| Read an aggregate with 2,500 events | wrong result¹ | 142 ms · 4 requests² | **77 ms · 1 request** | **67 ms · 1 request** |
 
-**Cache hit provides 95-99% latency reduction!**
+¹ 1.1.1 silently stops at PostgREST's row limit (1,000 on Supabase): it returned 1,000 events and `totalEvents = 1000`.
+² Includes a one-time request per process that detects the missing database functions.
+
+The gains come from round trips, so they grow with the latency between your application and Supabase. By default every read still checks the database for new events (one small request that usually returns nothing); `maxStalenessMs` trades that check for a bounded delay, see below.
 
 ## Architecture
 
@@ -615,6 +589,7 @@ describe('EventStore', () => {
     ├─ SupabaseSequenceRepository     │
     ├─ SupabaseSnapshotRepository     │
     ├─ SupabaseEventPublisher         │
+    ├─ MemoryCacheService (default)   │
     ├─ RedisCacheService              │
     └─ NoOpCacheService               │
     └─────────────────────────────────┘
@@ -691,7 +666,7 @@ try {
 ### Redis Configuration
 
 ```typescript
-import Redis from 'ioredis';
+import { Cluster, Redis } from 'ioredis';
 
 // Standalone
 const redis = new Redis({
@@ -702,7 +677,7 @@ const redis = new Redis({
 });
 
 // Cluster
-const redis = new Redis.Cluster([
+const redis = new Cluster([
   { host: 'node1', port: 6379 },
   { host: 'node2', port: 6379 },
 ]);
@@ -716,6 +691,48 @@ const redis = new Redis({
   name: 'mymaster',
 });
 ```
+
+### Caching & Consistency
+
+Without Redis, every `EventStore` keeps a bounded in-memory LRU cache. Because events are immutable and only ever appended, a cached aggregate never becomes wrong – it can only fall behind. Reads therefore ask the database only for events newer than the cached ones, and `maxStalenessMs` controls how often they ask:
+
+| `maxStalenessMs` | Behaviour | Use when |
+|---|---|---|
+| `0` (default without Redis) | Every read checks for newer events with one small query | Several instances or serverless functions write to the same aggregates |
+| e.g. `2000` | Reads within 2 s after the last check are served from memory without a request | A short delay for changes made by *other* instances is acceptable |
+| `Infinity` | The cache is only updated by this instance's own writes and TTL expiry | A single instance writes all events |
+
+Writes made through an `EventStore` update its own cache immediately, whatever the setting. With Redis, plain reads trust the shared cache as in previous versions (appends from any instance invalidate it), while replays always check for newer events; setting `maxStalenessMs` applies one policy to both.
+
+```typescript
+const eventStore = createEventStore({
+  supabase,
+  cache: {
+    maxStalenessMs: 2000,
+    memory: {
+      maxEntries: 10_000,           // default
+      maxSizeBytes: 64 * 1024 ** 2, // default: 64 MiB
+    },
+  },
+});
+```
+
+Create the `EventStore` once and reuse it: the in-memory cache lives in the instance. If you use user-scoped Supabase clients with row level security, do not share an `EventStore` – or a Redis cache – between users who may see different data.
+
+### Options of `createEventStore`
+
+| Option | Default | Description |
+|---|---|---|
+| `supabase` | – | Supabase client |
+| `redis` | – | Redis client (e.g. `ioredis`); enables the shared Redis cache |
+| `cache.enabled` | `true` | `false` disables caching |
+| `cache.maxStalenessMs` | see above | Consistency of cached reads |
+| `cache.ttl` | see below | TTLs in seconds per cache type |
+| `cache.keyPrefix` | `'es:'` | Prefix of all cache keys |
+| `cache.memory` | 10,000 entries / 64 MiB | Limits of the in-memory cache |
+| `enablePublisher` | `false` | Enables `subscribeToEvents` |
+| `rpc` | `'auto'` | Use the database functions: `'auto'` detects them, `true` requires them, `false` never uses them |
+| `pageSize` | `1000` | Rows per request when paging; must not exceed PostgREST's `max-rows` |
 
 ### Cache TTL Strategy
 
@@ -734,6 +751,22 @@ const eventStore = createEventStore({
   },
 });
 ```
+
+## Upgrading from 1.1
+
+The public API is unchanged. Behaviour changes to be aware of:
+
+- **Caching is on by default** (in-memory, always consistent). Disable it with `cache: { enabled: false }`.
+- **Dependencies:** `ioredis` is no longer installed with the package and `@supabase/supabase-js` is a peer dependency. Node.js 22 or newer is required.
+- **Complete results:** reads no longer stop silently at PostgREST's row limit (1,000 on Supabase). This affects `getAggregateEvents`, replays, `getAggregateStats`, `validateEventStream` and `queryEvents` without `limit` – which now returns *all* matching events.
+- `getEventsByType` returns the most recent events first (by `created_at`); previously it sorted by the per-aggregate sequence number.
+- `replayEventStream` starts at `from_sequence` (previously `from_sequence + 1`) and no longer skips events of streams spanning several aggregates.
+- `replayEvents` with `to_sequence` and `getStateAtSequence` start from the latest snapshot *at or before* that sequence; previously a newer snapshot could yield a later state.
+- `rebuildWithSnapshots` stores its snapshots in one request and no longer writes the last one twice.
+- `subscribeToEvents` supports several subscriptions at once (with current supabase-js the second one threw).
+- Redis uses `SCAN`/`UNLINK` instead of the blocking `KEYS`/`DEL`. Cached aggregate streams use new keys; old entries expire with their TTL.
+- Custom `ICacheService` implementations now receive writes; previously only `RedisCacheService` did.
+- All types, ports and adapters are exported from the package root.
 
 ## API Reference
 
