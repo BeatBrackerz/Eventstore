@@ -1,3 +1,16 @@
+# [1.2.0](https://github.com/beatbrackerz/eventstore/compare/v1.1.1...v1.2.0) (2026-09-25)
+
+
+### Bug Fixes
+
+* allow several realtime subscriptions at once ([639878a](https://github.com/beatbrackerz/eventstore/commit/639878af8f9b54f7f68840abf0777e94a36f1c10))
+
+
+### Features
+
+* add sql/eventstore.sql with indexes and database functions ([fc1a00f](https://github.com/beatbrackerz/eventstore/commit/fc1a00fae854072e13a5e69bd70060a58566e9df))
+* fast reads without Redis, single round-trip writes and updated toolchain ([8f0827b](https://github.com/beatbrackerz/eventstore/commit/8f0827b0776ea19aa0d1eb9b6eb8b15a7cee36c6))
+
 ## [1.1.1](https://github.com/beatbrackerz/eventstore/compare/v1.1.0...v1.1.1) (2026-01-20)
 
 
