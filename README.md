@@ -76,12 +76,13 @@ const eventStore = createEventStore({
   enablePublisher: true,
 });
 
-// Append an event
+// Append an event (aggregate_id and created_by are UUIDs)
+const orderId = crypto.randomUUID();
 const event = await eventStore.appendEvent({
   type: 'OrderCreated',
-  aggregate_id: '123e4567-e89b-12d3-a456-426614174000',
+  aggregate_id: orderId,
   aggregate_type: 'order',
-  created_by: 'user-123',
+  created_by: '40c80bde-aeae-4943-a15f-167df8d85ddd', // the acting user, e.g. a Supabase auth user id
   payload: {
     customerId: 'customer-456',
     items: [{ productId: 'product-789', quantity: 2 }],
@@ -138,7 +139,7 @@ const event = await eventStore.appendEvent({
   type: 'UserRegistered',
   aggregate_id: userId,
   aggregate_type: 'user',
-  created_by: 'system',
+  created_by: '00000000-0000-0000-0000-000000000000', // e.g. a fixed UUID for system events
   payload: {
     email: 'user@example.com',
     name: 'John Doe',
@@ -154,14 +155,14 @@ const events = await eventStore.appendEvents([
     type: 'ProductCreated',
     aggregate_id: productId,
     aggregate_type: 'product',
-    created_by: 'admin-123',
+    created_by: adminId,
     payload: { name: 'Laptop', price: 999.99 },
   },
   {
     type: 'InventoryUpdated',
     aggregate_id: productId,
     aggregate_type: 'product',
-    created_by: 'admin-123',
+    created_by: adminId,
     payload: { quantity: 100 },
   },
 ]);
@@ -173,7 +174,7 @@ const events = await eventStore.appendEvents([
 
 ```typescript
 const events = await eventStore.getAggregateEvents(
-  'order-123',
+  orderId,
   'order'
 );
 
@@ -209,14 +210,14 @@ const recentOrders = await eventStore.getEventsByType(
 
 ```typescript
 const currentState = {
-  orderId: 'order-123',
+  orderId,
   status: 'confirmed',
   items: [...],
   totalAmount: 299.99,
 };
 
 const snapshot = await eventStore.createSnapshot({
-  aggregate_id: 'order-123',
+  aggregate_id: orderId,
   aggregate_type: 'order',
   sequence_number: 42,
   state: currentState,
@@ -227,7 +228,7 @@ const snapshot = await eventStore.createSnapshot({
 
 ```typescript
 const snapshot = await eventStore.getLatestSnapshot(
-  'order-123',
+  orderId,
   'order'
 );
 
@@ -242,7 +243,7 @@ if (snapshot) {
 ```typescript
 // Keep only the 3 most recent snapshots
 const deletedCount = await eventStore.pruneSnapshots(
-  'order-123',
+  orderId,
   'order',
   3
 );
@@ -313,7 +314,7 @@ const orderProjection: EventProjection<OrderState> = {
 ```typescript
 // Get current state by replaying all events
 const currentState = await eventStore.replayEvents(
-  'order-123',
+  orderId,
   'order',
   orderProjection
 );
@@ -326,7 +327,7 @@ console.log('Current order state:', currentState);
 ```typescript
 // Get state at specific sequence number
 const pastState = await eventStore.getStateAtSequence(
-  'order-123',
+  orderId,
   'order',
   orderProjection,
   25 // sequence number
@@ -340,7 +341,7 @@ console.log('Order state at sequence 25:', pastState);
 ```typescript
 // Rebuild state and create snapshots every 50 events
 const finalState = await eventStore.rebuildWithSnapshots(
-  'order-123',
+  orderId,
   'order',
   orderProjection,
   50 // snapshot interval
@@ -394,7 +395,7 @@ unsubscribeOrders();
 
 ```typescript
 const stats = await eventStore.getAggregateStats(
-  'order-123',
+  orderId,
   'order'
 );
 
@@ -412,7 +413,7 @@ stats.eventTypes.forEach((count, type) => {
 
 ```typescript
 const validation = await eventStore.validateEventStream(
-  'order-123',
+  orderId,
   'order'
 );
 
@@ -428,10 +429,10 @@ if (!validation.valid) {
 
 ```typescript
 // Warm up cache for frequently accessed aggregate
-await eventStore.warmupCache('order-123', 'order');
+await eventStore.warmupCache(orderId, 'order');
 
 // Clear cache for specific aggregate
-await eventStore.clearAggregateCache('order-123', 'order');
+await eventStore.clearAggregateCache(orderId, 'order');
 
 // Clear all cache
 await eventStore.clearCache();
@@ -507,7 +508,7 @@ class MockEventRepository implements IEventRepository {
   
   async saveEvent(event, sequenceNumber) {
     const record = {
-      id: `test-${Date.now()}`,
+      id: crypto.randomUUID(),
       ...event,
       sequence_number: sequenceNumber,
       created_at: new Date().toISOString(),
@@ -540,9 +541,9 @@ describe('EventStore', () => {
     
     const event = await eventStore.appendEvent({
       type: 'TestEvent',
-      aggregate_id: 'test-123',
+      aggregate_id: crypto.randomUUID(),
       aggregate_type: 'test',
-      created_by: 'tester',
+      created_by: crypto.randomUUID(),
     });
     
     expect(event.type).toBe('TestEvent');
@@ -770,7 +771,7 @@ The public API is unchanged. Behaviour changes to be aware of:
 
 ## API Reference
 
-See [API Documentation](./docs/API.md) for complete API reference.
+`createEventStore`, `EventStore` and the types, ports and adapters are exported from the package root ([`src/index.ts`](src/index.ts)). They are documented with TSDoc comments in the sources – the `EventStore` methods in [`src/app/EventStore.ts`](src/app/EventStore.ts) – and in the type declarations shipped with the package, so editors show the documentation on hover.
 
 ## Contributing
 
