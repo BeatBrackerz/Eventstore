@@ -5,3 +5,6 @@ export * from './SupabaseEventPublisher.js';
 export * from './SupabaseEventRepository.js';
 export * from './SupabaseSequenceRepository.js';
 export * from './SupabaseSnapshotRepository.js';
+export * from './MemoryReadModelStore.js';
+export * from './SupabaseReadModelStore.js';
+export * from './ElasticsearchReadModelStore.js';

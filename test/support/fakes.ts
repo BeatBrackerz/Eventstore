@@ -10,6 +10,8 @@ import {
     type LoadedStream,
     MemoryCacheService,
     type QueryEventsOptions,
+    type ReadAllQuery,
+    type ReadAllResult,
     type SnapshotRecord,
     type StreamQuery,
 } from '../../src/index.js';
@@ -23,8 +25,17 @@ export class FakeDatabase {
     snapshots: SnapshotRecord[] = [];
     sequences = new Map<string, number>();
     calls: string[] = [];
+    /** Transactions that have not committed yet: readAll holds back their events and all later ones */
+    openTransactions = new Set<number>();
     private counter = 0;
+    private transaction = 0;
+    private globalPosition = 0;
     private clock = Date.UTC(2026, 0, 1);
+
+    /** Start a new transaction: events inserted until the next call belong to it */
+    beginTransaction(): number {
+        return ++this.transaction;
+    }
 
     nextId(prefix: string): string {
         return `${prefix}-${String(++this.counter).padStart(6, '0')}`;
@@ -56,6 +67,8 @@ export class FakeDatabase {
             metadata: event.metadata ?? {},
             created_at: this.now(),
             created_by: event.created_by,
+            transaction_id: String(this.transaction),
+            global_position: ++this.globalPosition,
         };
         this.events.push(record);
         return structuredClone(record);
@@ -80,6 +93,7 @@ export interface Capabilities {
     loadStream?: boolean;
     stats?: boolean;
     paging?: boolean;
+    readAll?: boolean;
 }
 
 export class FakeEventRepository implements IEventRepository {
@@ -87,22 +101,26 @@ export class FakeEventRepository implements IEventRepository {
     loadStream?: IEventRepository['loadStream'];
     getAggregateStats?: IEventRepository['getAggregateStats'];
     findEventsPage?: IEventRepository['findEventsPage'];
+    readAll?: IEventRepository['readAll'];
 
     constructor(private readonly db: FakeDatabase, capabilities: Capabilities = {}) {
-        const all = { atomicAppend: true, loadStream: true, stats: true, paging: true, ...capabilities };
+        const all = { atomicAppend: true, loadStream: true, stats: true, paging: true, readAll: true, ...capabilities };
         if (all.atomicAppend) this.appendEvents = events => this.atomicAppend(events);
         if (all.loadStream) this.loadStream = query => this.load(query);
         if (all.stats) this.getAggregateStats = (id, type) => this.stats(id, type);
         if (all.paging) this.findEventsPage = (options, offset, limit) => this.page(options, offset, limit);
+        if (all.readAll) this.readAll = query => this.all(query);
     }
 
     async saveEvent(event: CreateEventInput, sequenceNumber: number): Promise<EventRecord> {
         this.db.record('saveEvent');
+        this.db.beginTransaction();
         return this.db.insertEvent(event, sequenceNumber);
     }
 
     async saveEvents(events: Array<{ event: CreateEventInput; sequenceNumber: number }>): Promise<EventRecord[]> {
         this.db.record('saveEvents');
+        this.db.beginTransaction();
         return events.map(({event, sequenceNumber}) => this.db.insertEvent(event, sequenceNumber));
     }
 
@@ -132,6 +150,7 @@ export class FakeEventRepository implements IEventRepository {
 
     private async atomicAppend(events: CreateEventInput[]): Promise<EventRecord[]> {
         this.db.record('appendEvents');
+        this.db.beginTransaction();
         const next = new Map<string, number>();
         const counts = new Map<string, number>();
         for (const e of events) {
@@ -177,6 +196,25 @@ export class FakeEventRepository implements IEventRepository {
             lastEvent: events.at(-1) ?? null,
             eventTypes: [...types],
         });
+    }
+
+    // Like es_read_all: commit order, held back at the oldest open transaction
+    private async all(query: ReadAllQuery): Promise<ReadAllResult> {
+        this.db.record('readAll');
+        const horizon = Math.min(Infinity, ...this.db.openTransactions);
+        const after = [Number(query.after.transactionId), query.after.globalPosition];
+        const readable = this.db.events
+            .filter(e => Number(e.transaction_id) < horizon)
+            .filter(e => Number(e.transaction_id) > after[0] || (Number(e.transaction_id) === after[0] && e.global_position! > after[1]))
+            .sort((a, b) => Number(a.transaction_id) - Number(b.transaction_id) || a.global_position! - b.global_position!);
+        const matching = readable
+            .filter(e => !query.eventTypes || query.eventTypes.includes(e.type))
+            .filter(e => !query.aggregateTypes || query.aggregateTypes.includes(e.aggregate_type));
+        const events = matching.slice(0, query.limit);
+        const done = events.length < query.limit;
+        const last = done ? readable.at(-1) : events.at(-1);
+        const next = last ? { transactionId: last.transaction_id!, globalPosition: last.global_position! } : query.after;
+        return structuredClone({ events, next, done });
     }
 
     private async page(options: QueryEventsOptions, offset: number, limit: number): Promise<EventRecord[]> {

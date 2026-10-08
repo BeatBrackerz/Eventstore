@@ -3,3 +3,4 @@ export * from './IEventPublisher.js';
 export * from './IEventRepository.js';
 export * from './ISequenceRepository.js';
 export * from './ISnapshotRepository.js';
+export * from './IReadModelStore.js';

@@ -1,4 +1,4 @@
-import type {CreateEventInput, EventRecord, QueryEventsOptions, SnapshotRecord} from "../domain/index.js";
+import type {CreateEventInput, EventRecord, Position, QueryEventsOptions, SnapshotRecord} from "../domain/index.js";
 
 /**
  * Query for loading an aggregate's event stream in one call
@@ -30,6 +30,25 @@ export interface AggregateStatsData {
 }
 
 /**
+ * Query for reading events of all aggregates in commit order
+ */
+export interface ReadAllQuery {
+    after: Position; // Exclusive
+    limit: number;
+    eventTypes?: readonly string[]; // Only events of these types
+    aggregateTypes?: readonly string[]; // Only events of these aggregate types
+}
+
+/**
+ * Result of {@link IEventRepository.readAll}
+ */
+export interface ReadAllResult {
+    events: EventRecord[];
+    next: Position; // Where to continue; ahead of the last event when filtered events were skipped
+    done: boolean; // No further events available right now
+}
+
+/**
  * Port: Event Repository
  * Defines contract for event persistence
  *
@@ -52,4 +71,10 @@ export interface IEventRepository {
     getAggregateStats?(aggregateId: string, aggregateType: string): Promise<AggregateStatsData | undefined>;
     /** Page through matching events in global order (created_at, sequence_number, id). */
     findEventsPage?(options: Omit<QueryEventsOptions, 'limit' | 'order'>, offset: number, limit: number): Promise<EventRecord[]>;
+    /**
+     * Events of all aggregates after a position, in commit order. Must never return an event
+     * behind a position it has already returned (events of transactions still running are held back).
+     * Required for projections.
+     */
+    readAll?(query: ReadAllQuery): Promise<ReadAllResult | undefined>;
 }

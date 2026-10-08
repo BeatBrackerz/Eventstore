@@ -1,7 +1,17 @@
 {
   "name": "@beatbrackerz/eventstore",
   "version": "1.2.0",
-  "description": "Reusable event store implementation for Supabase with optimized performance and support for event sourcing patterns.",
+  "description": "Event Sourcing and CQRS for Supabase: atomic appends, cached aggregate reads, and projections that keep read models (Supabase tables, optionally Elasticsearch) up to date exactly once.",
+  "keywords": [
+    "event-sourcing",
+    "cqrs",
+    "supabase",
+    "postgresql",
+    "projections",
+    "read-models",
+    "elasticsearch",
+    "typescript"
+  ],
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
@@ -43,6 +53,7 @@
     "@supabase/supabase-js": "^2.91.0"
   },
   "devDependencies": {
+    "@elastic/elasticsearch": "^9.5.1",
     "@semantic-release/changelog": "^7.0.0",
     "@semantic-release/commit-analyzer": "^13.0.1",
     "@semantic-release/git": "^11.0.1",

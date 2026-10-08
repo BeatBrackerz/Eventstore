@@ -18,7 +18,7 @@ The integration tests run the Supabase adapters against a real PostgREST (the RE
 - PostgreSQL 15 or newer and `psql` (connection via the usual `PG*` environment variables),
 - Redis (optional).
 
-`scripts/integration-env.sh` creates two databases – one with `sql/eventstore.sql` applied and one with the schema of earlier versions – downloads PostgREST, starts one instance per database and prints the environment variables the tests read:
+`scripts/integration-env.sh` creates three databases – one with `sql/eventstore.sql` applied (twice, to check that it can be run again) plus the read model tables of the projection tests (`test/integration/read-models.sql`), one with the schema of earlier versions, and one like the first with monthly partitions and protected, audited events – downloads PostgREST, starts one instance per database and prints the environment variables the tests read:
 
 ```bash
 eval "$(PGHOST=localhost PGUSER=postgres scripts/integration-env.sh)"
@@ -26,7 +26,7 @@ export EVENTSTORE_IT_REDIS_URL=redis://localhost:6379/15
 npm run test:integration
 ```
 
-The script drops and recreates the databases `es_it` and `es_it_legacy`. CI runs the same setup (see `.github/workflows/ci.yml`) and sets `EVENTSTORE_IT_REQUIRED` so that an incomplete environment fails instead of skipping the tests.
+The script drops and recreates the databases `es_it`, `es_it_legacy` and `es_it_partitioned`. Tests that need their own transactions or databases (commit order of projections, upgrading an existing events table, partitioning and audit) use `psql` with the same `PG*` variables and create `es_it_upgrade` and `es_it_partitioning`. The pgaudit assertions only run where the extension is installed and in `shared_preload_libraries` (not in CI); without it, `es_enable_audit` is tested to protect the events and warn. CI runs the same setup (see `.github/workflows/ci.yml`) and sets `EVENTSTORE_IT_REQUIRED` so that an incomplete environment fails instead of skipping the tests.
 
 ## Benchmark
 
