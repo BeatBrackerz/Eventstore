@@ -209,17 +209,23 @@ export class ProjectionEngine {
         const deadline = Date.now() + timeoutMs;
 
         await Promise.all(this.select(names).map(async state => {
+            const timedOut = () => new ProjectionError(
+                `Projection ${state.name} did not reach position ${target.transactionId}/${target.globalPosition} within ${timeoutMs} ms`,
+                state.name
+            );
+
             // Events of transactions that started earlier but are still running hold back newer ones
             for (let delay = 5; !reached(state, target); delay = Math.min(delay * 2, 100)) {
-                await this.pass(state);
-                if (reached(state, target)) return;
-                if (Date.now() >= deadline) {
-                    throw new ProjectionError(
-                        `Projection ${state.name} did not reach position ${target.transactionId}/${target.globalPosition} within ${timeoutMs} ms`,
-                        state.name
-                    );
+                // A long catch-up (or a handler appending to its own projection) continues in the background
+                const pass = this.pass(state);
+                if (!(await settlesWithin(pass, deadline - Date.now()))) {
+                    pass.then(() => this.recovered(state), err => this.report(state, err));
+                    throw timedOut();
                 }
-                await sleep(delay);
+                await pass;
+                if (reached(state, target)) return;
+                if (Date.now() >= deadline) throw timedOut();
+                await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
             }
         }));
     }
@@ -331,7 +337,7 @@ export class ProjectionEngine {
                 const context = new BatchContext(state);
                 for (const event of batch.events) {
                     if (!handles(state, event)) continue;
-                    context.position = positionOf(event) ?? batch.next;
+                    context.begin(positionOf(event) ?? batch.next);
                     try {
                         await state.definition.handlers[event.type](event, context);
                     } catch (err) {
@@ -530,16 +536,23 @@ export class ReadModels {
  */
 class BatchContext implements ProjectionContext {
     readonly changes: ReadModelChange[] = [];
-    position: Position = START_POSITION;
+    private position: Position = START_POSITION;
+    private ordinal = 0;
     private readonly loaded = new Map<string, Promise<ReadModelRow | null>>();
 
     constructor(private readonly state: ProjectionState) {}
+
+    /** Start collecting the changes of the next event */
+    begin(position: Position): void {
+        this.position = position;
+        this.ordinal = 0;
+    }
 
     upsert(collection: string, row: ReadModelRow): void {
         const key = normalizeKey(this.collection(collection), row);
         // Undefined values are not given (as in JSON), so they leave the stored value unchanged
         const given = Object.fromEntries(Object.entries(row).filter(([, value]) => value !== undefined));
-        this.changes.push({ op: 'upsert', collection, key, row: structuredClone(given), position: this.position });
+        this.push({ op: 'upsert', collection, key, row: structuredClone(given) });
     }
 
     increment(collection: string, key: ReadModelKey, values: Record<string, number>): void {
@@ -548,12 +561,12 @@ class BatchContext implements ProjectionContext {
             if (column in normalized) throw new EventStoreError(`increment: ${column} is a key column of ${collection}`);
             if (typeof value !== 'number' || !Number.isFinite(value)) throw new EventStoreError(`increment: ${column} must be a finite number`);
         }
-        this.changes.push({ op: 'increment', collection, key: normalized, values: { ...values }, position: this.position });
+        this.push({ op: 'increment', collection, key: normalized, values: { ...values } });
     }
 
     delete(collection: string, key: ReadModelKey): void {
         const normalized = normalizeKey(this.collection(collection), key);
-        this.changes.push({ op: 'delete', collection, key: normalized, position: this.position });
+        this.push({ op: 'delete', collection, key: normalized });
     }
 
     async get<T extends ReadModelRow = ReadModelRow>(collection: string, key: ReadModelKey): Promise<T | null> {
@@ -576,12 +589,18 @@ class BatchContext implements ProjectionContext {
         return row as T | null;
     }
 
+    private push(change: Unpositioned<ReadModelChange>): void {
+        this.changes.push({ ...change, position: this.position, ordinal: this.ordinal++ } as ReadModelChange);
+    }
+
     private collection(name: string): ReadModelCollection {
         const collection = this.state.collections.get(name);
         if (!collection) throw new EventStoreError(`Projection ${this.state.name} does not declare collection ${name}`);
         return collection;
     }
 }
+
+type Unpositioned<T> = T extends unknown ? Omit<T, 'position' | 'ordinal'> : never;
 
 function handles(state: ProjectionState, event: EventRecord): boolean {
     const aggregateTypes = state.definition.aggregateTypes;
@@ -606,4 +625,19 @@ function messageOf(err: unknown): string {
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Whether the promise settles (fulfilled or rejected) within `ms`
+ */
+async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<false>(resolve => {
+        timer = setTimeout(() => resolve(false), Math.max(0, ms));
+    });
+    try {
+        return await Promise.race([promise.then(() => true, () => true), timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
 }

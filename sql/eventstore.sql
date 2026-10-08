@@ -388,21 +388,30 @@ $$;
 -- aggregate_sequences. The row lock it takes is held until commit, which
 -- serializes concurrent appends per aggregate: numbers are gap-free, unique
 -- and become visible in order.
+--
+-- Within each aggregate, commit order (transaction id) follows the sequence
+-- numbers, which projections rely on. A transaction gets its id with its first
+-- write; a batch that got it before waiting for the lock of a further aggregate
+-- could otherwise follow an append that started later. Such a batch fails with
+-- SQLSTATE 40001 instead and is retried by the library with a new id.
+-- Call the function as the first write of a transaction.
 create or replace function public.es_append_events(p_events jsonb)
 returns json
 language plpgsql
 set search_path = ''
 as $$
 declare
+  v_previous jsonb;
   v_result json;
 begin
   if p_events is null or jsonb_typeof(p_events) <> 'array' then
     raise exception 'es_append_events: p_events must be a JSON array' using errcode = '22023';
   end if;
 
+  -- Reserve sequence numbers; v_previous holds each aggregate's last sequence number before this batch
   with input as (
-    select x.ord, r.type, r.aggregate_id, r.aggregate_type, r.version, r.payload, r.metadata, r.created_by
-    from jsonb_array_elements(p_events) with ordinality as x(elem, ord)
+    select r.aggregate_id, r.aggregate_type
+    from jsonb_array_elements(p_events) as x(elem)
     cross join lateral jsonb_populate_record(null::public.events, x.elem) as r
   ),
   counts as (
@@ -419,14 +428,42 @@ begin
     on conflict (aggregate_id, aggregate_type)
       do update set last_sequence = s.last_sequence + excluded.last_sequence
     returning s.aggregate_id, s.aggregate_type, s.last_sequence
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'aggregate_id', r.aggregate_id,
+           'aggregate_type', r.aggregate_type,
+           'last_sequence', r.last_sequence - c.n
+         )), '[]'::jsonb)
+    into v_previous
+  from reserved r
+  join counts c on c.aggregate_id = r.aggregate_id and c.aggregate_type = r.aggregate_type;
+
+  -- A new statement sees appends that committed while this one waited for their locks
+  if exists (
+    select 1
+    from jsonb_populate_recordset(null::public.aggregate_sequences, v_previous) as p
+    join public.events e
+      on e.aggregate_id = p.aggregate_id
+     and e.aggregate_type = p.aggregate_type
+     and e.sequence_number = p.last_sequence
+    where e.transaction_id > pg_current_xact_id()
+  ) then
+    raise exception 'es_append_events: an append that started later committed first; retry'
+      using errcode = '40001';
+  end if;
+
+  with input as (
+    select x.ord, r.type, r.aggregate_id, r.aggregate_type, r.version, r.payload, r.metadata, r.created_by
+    from jsonb_array_elements(p_events) with ordinality as x(elem, ord)
+    cross join lateral jsonb_populate_record(null::public.events, x.elem) as r
   ),
   numbered as (
     select i.*,
-           r.last_sequence - c.n
+           p.last_sequence
              + row_number() over (partition by i.aggregate_id, i.aggregate_type order by i.ord) as sequence_number
     from input i
-    join counts c on c.aggregate_id = i.aggregate_id and c.aggregate_type = i.aggregate_type
-    join reserved r on r.aggregate_id = i.aggregate_id and r.aggregate_type = i.aggregate_type
+    join jsonb_populate_recordset(null::public.aggregate_sequences, v_previous) as p
+      on p.aggregate_id = i.aggregate_id and p.aggregate_type = i.aggregate_type
   ),
   inserted as (
     insert into public.events (type, aggregate_id, aggregate_type, sequence_number, version, payload, metadata, created_by)
@@ -634,9 +671,10 @@ $$;
 
 -- Apply a batch of read model changes and move a projection's checkpoint, atomically.
 --
--- Nothing is applied and false is returned if the checkpoint is not at the expected
--- position or version (another process got there first, or the projection was rebuilt).
--- Every batch is therefore applied exactly once, even with several projectors.
+-- Nothing is applied and false is returned if the checkpoint is missing or not at the
+-- expected position or version (another process got there first, or the projection was
+-- rebuilt; es_reset_projection creates it). Every batch is therefore applied exactly once,
+-- even with several projectors.
 --
 -- p_changes: JSON array of statements, applied in order:
 --   {"op": "upsert"|"increment"|"delete", "table": "<table in schema public>",
@@ -644,7 +682,8 @@ $$;
 -- upsert inserts rows or updates the given columns of existing ones (other columns
 -- keep their values), increment adds the given values to existing rows (inserting
 -- them as initial values), delete removes rows by key. Every row of a statement has
--- the same columns and a different key; "key" must match a unique index of the table.
+-- the same columns; "key" must match a unique index of the table. Rows with equal keys
+-- (as compared by the column types) are merged: the last upsert wins, increments add up.
 create or replace function public.es_project(
   p_projection text,
   p_version integer,
@@ -665,13 +704,12 @@ declare
   v_keys text;
   v_columns text;
   v_assignments text;
+  v_sums text;
 begin
-  insert into public.es_projections (name, version) values (p_projection, p_version)
-  on conflict (name) do nothing;
-
   select * into v_checkpoint from public.es_projections where name = p_projection for update;
 
-  if v_checkpoint.version <> p_version
+  if not found
+     or v_checkpoint.version <> p_version
      or v_checkpoint.transaction_id <> p_expected_transaction_id
      or v_checkpoint.global_position <> p_expected_position then
     return false;
@@ -697,18 +735,29 @@ begin
         where c not in (select jsonb_array_elements_text(v_change->'key'));
 
         execute format(
-          'insert into %1$s as t (%2$s) select %2$s from jsonb_populate_recordset(null::%1$s, $1) on conflict (%3$s) do %4$s',
+          'insert into %1$s as t (%2$s) '
+          'select distinct on (%3$s) %2$s from jsonb_populate_recordset(null::%1$s, $1) with ordinality as r '
+          'order by %3$s, r.ordinality desc '
+          'on conflict (%3$s) do %4$s',
           v_table, v_columns, v_keys, coalesce('update set ' || v_assignments, 'nothing')
         ) using v_change->'rows';
 
       when 'increment' then
-        select string_agg(format('%1$I = coalesce(t.%1$I, 0) + excluded.%1$I', c), ', ') into v_assignments
+        select string_agg(format('%1$I = coalesce(t.%1$I, 0) + excluded.%1$I', c), ', '),
+               string_agg(format('sum(%1$I)', c), ', ')
+          into v_assignments, v_sums
         from jsonb_array_elements_text(v_change->'columns') as c
         where c not in (select jsonb_array_elements_text(v_change->'key'));
 
         execute format(
-          'insert into %1$s as t (%2$s) select %2$s from jsonb_populate_recordset(null::%1$s, $1) on conflict (%3$s) do %4$s',
-          v_table, v_columns, v_keys, coalesce('update set ' || v_assignments, 'nothing')
+          'insert into %1$s as t (%2$s%3$s) '
+          'select %2$s%4$s from jsonb_populate_recordset(null::%1$s, $1) group by %2$s '
+          'on conflict (%2$s) do %5$s',
+          v_table, v_keys,
+          coalesce(', ' || (select string_agg(format('%I', c), ', ') from jsonb_array_elements_text(v_change->'columns') as c
+                            where c not in (select jsonb_array_elements_text(v_change->'key'))), ''),
+          coalesce(', ' || v_sums, ''),
+          coalesce('update set ' || v_assignments, 'nothing')
         ) using v_change->'rows';
 
       when 'delete' then
@@ -753,6 +802,7 @@ declare
   v_created boolean;
   v_name text;
   v_table regclass;
+  v_tables regclass[] := '{}';
 begin
   insert into public.es_projections (name, version) values (p_projection, p_version)
   on conflict (name) do nothing
@@ -776,14 +826,21 @@ begin
                    'public.aggregate_sequences'::regclass, 'public.es_projections'::regclass) then
       raise exception 'es_reset_projection: % is not a read model table', v_table using errcode = '42501';
     end if;
-
-    begin
-      execute format('truncate table %s', v_table);
-    exception when others then
-      -- No TRUNCATE privilege, or the table is referenced by foreign keys
-      execute format('delete from %s', v_table);
-    end;
+    v_tables := v_tables || v_table;
   end loop;
+
+  if cardinality(v_tables) > 0 then
+    begin
+      -- One statement, so foreign keys between the projection's own tables do not get in the way
+      execute format('truncate table %s', array_to_string(v_tables::text[], ', '));
+    exception when others then
+      -- No TRUNCATE privilege, or referenced by other tables: delete, referencing tables
+      -- (usually declared after the referenced ones) first
+      for i in reverse cardinality(v_tables) .. 1 loop
+        execute format('delete from %s', v_tables[i]);
+      end loop;
+    end;
+  end if;
 
   update public.es_projections
   set version = p_version, transaction_id = '0', global_position = 0, updated_at = now()

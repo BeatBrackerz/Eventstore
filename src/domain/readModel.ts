@@ -73,12 +73,14 @@ export type ReadModelRow = Record<string, unknown>;
 
 /**
  * A change to a read model, as collected while a projection handles events. `key` holds the
- * key columns in the order the collection declares them.
+ * key columns in the order the collection declares them; `position` is the event's position and
+ * `ordinal` the index of the change among the changes made for that event.
  */
-export type ReadModelChange =
-    | { op: 'upsert'; collection: string; key: ReadModelRow; row: ReadModelRow; position: Position }
-    | { op: 'increment'; collection: string; key: ReadModelRow; values: Record<string, number>; position: Position }
-    | { op: 'delete'; collection: string; key: ReadModelRow; position: Position };
+export type ReadModelChange = { collection: string; key: ReadModelRow; position: Position; ordinal?: number } & (
+    | { op: 'upsert'; row: ReadModelRow }
+    | { op: 'increment'; values: Record<string, number> }
+    | { op: 'delete' }
+);
 
 /**
  * What a projection handler can do with its read models. Changes are collected and stored

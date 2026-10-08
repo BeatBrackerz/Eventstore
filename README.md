@@ -514,9 +514,10 @@ To make Elasticsearch the default store of all projections, pass it as `readMode
 
 How it works:
 
-- Each collection is an index (`indexPrefix` + name), each row a document whose id is its key (a JSON array for composite keys). When a projection starts or is rebuilt, the store creates missing indices with your `mappings`/`settings`; strings without explicit mapping become `keyword`, so filters and sorting behave as with table columns.
+- Each collection is read through the alias `indexPrefix` + name; each row is a document whose id is its key (a JSON array for composite keys). Strings without explicit mapping become `keyword`, so filters and sorting behave as with table columns.
+- Every reset – a new projection, a version bump, `rebuild()` – writes a **new generation** of indices (`<alias>-<generation id>`, created with your `mappings`/`settings`) and moves the alias to it in one atomic step, dropping the previous generation. Instances still writing the previous generation (old version during a rolling deploy, a commit racing a rebuild) write into indices nobody reads anymore.
 - Checkpoints live in the index `eventstore-projections` (`checkpointIndex`) and move with optimistic concurrency control.
-- Elasticsearch has no transactions. Writes are therefore **idempotent**: every document stores the position of the last event applied to it (`es_tx`, `es_pos`, hidden from results) and older changes are skipped, so a batch written twice has no further effect. Deletes are not guarded – if a projection deletes, run it in one worker.
+- Elasticsearch has no transactions. Writes are therefore **idempotent**: every document stores its last applied change – event position and the change's number within the event (`es_tx`, `es_pos`, `es_ord`, hidden from results) – and older changes are skipped, so a batch written twice has no further effect. Deletes are not guarded – if a projection deletes, run it in one worker.
 - `refresh: 'wait_for'` (default) makes a batch searchable before the commit returns, which `consistentWith` relies on; `refresh: false` maximizes indexing throughput.
 - Queries use `from`/`size`: Elasticsearch caps `offset + limit` at `index.max_result_window` (10,000).
 
@@ -530,7 +531,7 @@ The official client satisfies the store's minimal client interface structurally 
 |---|---|---|
 | Tables | `events`, `aggregate_sequences`, `snapshots`, `es_projections` (created if missing) | Event store and projection checkpoints |
 | Commit order | `events.transaction_id` (`xid8`) and `events.global_position` (identity) + index | Projections read all events in commit order without skipping any |
-| Appends | `es_append_events`: sequence numbers and insert in **one request**, locking per aggregate | 3 → 1 round trips, no duplicate sequence numbers under concurrency |
+| Appends | `es_append_events`: sequence numbers and insert in **one request**, locking per aggregate; within each aggregate, commit order follows the sequence numbers (a batch that would break it fails with `40001` and is retried automatically) | 3 → 1 round trips, no duplicate sequence numbers under concurrency, projections see every aggregate in order |
 | Reads | `es_load_stream`, `es_aggregate_stats` | Snapshot + events in one request; statistics without transferring the stream |
 | Projections | `es_read_all`, `es_project`, `es_reset_projection`, view `es_projection_status` | Commit-order reads; changes + checkpoint in one transaction; rebuilds; monitoring |
 | Ids | `es_uuid_v7()` as default of `events.id` and `snapshots.id` (replaces `gen_random_uuid()`) | Time-ordered ids are appended at the end of the primary key index instead of random pages: smaller index, fewer page writes and WAL |
@@ -707,7 +708,7 @@ The application layer depends only on the ports. Optional port methods (`appendE
 | Option | Default | Description |
 |---|---|---|
 | `indexPrefix` | `''` | Prepended to collection names |
-| `checkpointIndex` | `'eventstore-projections'` | Index of the checkpoints |
+| `checkpointIndex` | `'eventstore-projections'` | Index of the checkpoints (with each projection's index generation) |
 | `refresh` | `'wait_for'` | Refresh after each batch: `'wait_for'`, `true` or `false` |
 
 ## Custom adapters & testing
@@ -736,7 +737,7 @@ For tests, `MemoryReadModelStore` keeps read models in memory with the same sema
 - **Events** are specific facts in the past tense with the data needed to understand them later (`OrderItemAdded { sku, quantity, priceAtTime }`), not generic updates (`OrderUpdated { changes }`).
 - **Commands** validate against the aggregate's state (`replayEvents`), **queries** read read models. Don't query read models to decide commands: they may lag behind (async) and are rebuilt from events.
 - **One read model per screen or API** rather than one generic table. Duplicate data freely – projections keep it consistent.
-- **Handlers are deterministic** and only use the event and `ctx`: no calls to other services, no `Date.now()` (use `event.created_at`), so rebuilds produce the same result.
+- **Handlers are deterministic** and only use the event and `ctx`: no calls to other services, no `Date.now()` (use `event.created_at`), so rebuilds produce the same result. They don't append events either – react to events in a separate subscriber (`readAll`, `subscribeToEvents`) instead; an inline handler appending to its own projection would wait for itself until `waitTimeoutMs`.
 - **Snapshots** every 50–100 events for long-lived aggregates (`rebuildWithSnapshots`), and `pruneSnapshots` to keep a few.
 - **Errors:** all failures are `EventStoreError` (projection failures `ProjectionError` with `projection` and `event`) with the original error as `cause`.
 

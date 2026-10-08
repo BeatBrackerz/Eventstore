@@ -211,8 +211,10 @@ describe.skipIf(!env)('projections against PostgREST', () => {
     });
 
     it('rejects read model changes to the event store tables', async () => {
+        const projection = `evil-${randomUUID()}`;
+        await client.rpc('es_reset_projection', { p_projection: projection, p_version: 1 });
         const { error } = await client.rpc('es_project', {
-            p_projection: `evil-${randomUUID()}`, p_version: 1,
+            p_projection: projection, p_version: 1,
             p_expected_transaction_id: '0', p_expected_position: 0, p_transaction_id: '1', p_position: 1,
             p_changes: [{ op: 'delete', table: 'events', key: ['id'], columns: ['id'], rows: [] }],
         });
@@ -254,6 +256,37 @@ describe.skipIf(!env)('projections against PostgREST', () => {
             expect(await exited).toBe(0);
             const later = await es.readAll(after);
             expect(later.events.map(e => [e.type, e.aggregate_id])).toEqual([['Slow', slow], ['Fast', fast.aggregate_id]]);
+        });
+
+        it('keeps each aggregate in sequence order when a batch waits for the lock of another aggregate', async () => {
+            const es = store();
+            const anchor = await es.appendEvent(event('Anchor', randomUUID()));
+            const after = { transactionId: anchor.transaction_id!, globalPosition: anchor.global_position! };
+
+            // Aggregates in lock order a < b < x
+            const base = randomUUID().slice(0, 35);
+            const [a, b, x] = [`${base}1`, `${base}2`, `${base}3`];
+
+            // Another append holds the lock of b for a moment
+            const events = JSON.stringify([event('B0', b)]);
+            const psql = spawn('psql', ['-v', 'ON_ERROR_STOP=1', '-qAt', '-d', 'es_it', '-c',
+                `begin; select count(*) from json_array_elements(public.es_append_events('${events}'::jsonb)); select pg_sleep(1.5); commit;`]);
+            const exited = new Promise<number | null>(resolve => psql.on('exit', resolve));
+            await waitUntil(() => pg!.psql('es_it', `select count(*) from pg_stat_activity where query like '%pg_sleep(1.5)%' and state = 'active' and pid <> pg_backend_pid()`) === '1');
+
+            // A batch over a, b and x gets its transaction id with a, then waits for b ...
+            const batch = es.appendEvents([event('A1', a), event('B1', b), event('X2', x)]);
+            await waitUntil(() => pg!.psql('es_it', `select count(*) from pg_stat_activity where query like '%es_append_events%' and wait_event_type = 'Lock' and pid <> pg_backend_pid()`) === '1');
+
+            // ... while x's first event is appended and committed by a later transaction
+            const first = await es.appendEvent(event('X1', x));
+            expect(await exited).toBe(0);
+            const appended = await batch;
+
+            expect([first.sequence_number, appended[2].sequence_number]).toEqual([1, 2]);
+            expect(BigInt(appended[2].transaction_id!)).toBeGreaterThan(BigInt(first.transaction_id!));
+            const ofX = (await es.readAll(after)).events.filter(e => e.aggregate_id === x);
+            expect(ofX.map(e => e.type)).toEqual(['X1', 'X2']);
         });
 
         it('upgrades an existing events table and keeps every aggregate in sequence order', () => {

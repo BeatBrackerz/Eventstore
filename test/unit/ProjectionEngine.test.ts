@@ -6,6 +6,7 @@ import {
     type IEventPublisher,
     MemoryCacheService,
     MemoryReadModelStore,
+    type ProjectionCommit,
     type ProjectionDefinition,
     ProjectionError,
     type ProjectionOptions,
@@ -379,5 +380,43 @@ describe('upserts', () => {
         await es.appendEvent(event('Noted', 'n1', { body: null }));
 
         expect(await es.readModels.get('notes', 'n1')).toEqual({ id: 'n1', title: 'T', body: null });
+    });
+});
+
+describe('waiting', () => {
+    it('honours the timeout when a handler appends to its own projection', async () => {
+        let es!: EventStore;
+        const reentrant: ProjectionDefinition = {
+            name: 'reentrant',
+            collections: ['log'],
+            handlers: {
+                Ping: async (e, ctx) => {
+                    ctx.upsert('log', { id: e.aggregate_id });
+                    if (!e.payload.nested) await es.appendEvent(event('Ping', `${e.aggregate_id}-nested`, { nested: true }));
+                },
+            },
+        };
+        const result = setup({ projections: [reentrant], options: { waitTimeoutMs: 50 } });
+        es = result.es;
+
+        await es.appendEvent(event('Ping', 'p1'));
+        expect(result.errors[0].message).toMatch(/did not reach position/);
+
+        await es.projections.catchUp();
+        expect(result.store.size('log')).toBe(2);
+    });
+
+    it('numbers the changes of each event', async () => {
+        const store = new MemoryReadModelStore();
+        const commits: ProjectionCommit[] = [];
+        const commit = store.commit.bind(store);
+        store.commit = async batch => {
+            commits.push(batch);
+            return commit(batch);
+        };
+        const { es } = setup({ store });
+
+        await es.appendEvents([event('OrderCreated', 'o1'), event('ItemAdded', 'o1', { price: 1 })]);
+        expect(commits.at(-1)!.changes.map(change => [change.op, change.ordinal])).toEqual([['upsert', 0], ['increment', 0]]);
     });
 });

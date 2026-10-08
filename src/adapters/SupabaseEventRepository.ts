@@ -8,6 +8,9 @@ type SortKey = ['sequence_number' | 'created_at' | 'id', boolean];
 // The load function returns one JSON value, so it is not capped by max-rows; page anyway to bound memory
 const RPC_PAGE_SIZE = 10_000;
 
+// es_append_events asks for a retry (SQLSTATE 40001) when a concurrent append would break commit order
+const APPEND_ATTEMPTS = 5;
+
 /**
  * Adapter: Supabase Event Repository
  */
@@ -90,7 +93,15 @@ export class SupabaseEventRepository implements IEventRepository {
      * Atomic append in one round trip (requires `es_append_events`)
      */
     async appendEvents(events: CreateEventInput[]): Promise<EventRecord[] | undefined> {
-        return this.rpc.call<EventRecord[]>('es_append_events', { p_events: events.map(toRow) });
+        const rows = events.map(toRow);
+        for (let attempt = 1; ; attempt++) {
+            try {
+                return await this.rpc.call<EventRecord[]>('es_append_events', { p_events: rows });
+            } catch (err) {
+                const code = err instanceof EventStoreError ? (err.cause as { code?: string } | undefined)?.code : undefined;
+                if (code !== '40001' || attempt >= APPEND_ATTEMPTS) throw err;
+            }
+        }
     }
 
     /**

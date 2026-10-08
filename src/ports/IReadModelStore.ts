@@ -27,9 +27,9 @@ export interface IReadModelStore {
     getCheckpoint(projection: string): Promise<ProjectionCheckpoint | null>;
     /**
      * Apply the changes and move the checkpoint from `expected` to `next`. Resolves to false
-     * without applying anything if the stored checkpoint is not at `expected` with `version`
-     * (another process got there first). Stores without transactions must apply changes so
-     * that applying a batch again has no further effect.
+     * without applying anything if no checkpoint is stored (`reset` creates it) or it is not at
+     * `expected` with `version` (another process got there first). Stores without transactions
+     * must apply changes so that applying a batch again has no further effect.
      */
     commit(commit: ProjectionCommit): Promise<boolean>;
     /**

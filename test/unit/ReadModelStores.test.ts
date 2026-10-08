@@ -17,6 +17,7 @@ describe('MemoryReadModelStore', () => {
 
     async function seeded() {
         const store = new MemoryReadModelStore();
+        await store.reset('p', 1, [products]);
         const rows = [
             { id: 'p1', name: 'Red Shoe', price: 50, tag: 'sale' },
             { id: 'p2', name: 'Blue Shoe', price: 80, tag: null },
@@ -48,6 +49,7 @@ describe('MemoryReadModelStore', () => {
         const store = await seeded();
         const change: ReadModelChange = { op: 'delete', collection: 'products', key: { id: 'p1' }, position: at(5) };
 
+        expect(await store.commit({ projection: 'unknown', version: 1, expected: START_POSITION, next: at(5), changes: [change] })).toBe(false);
         expect(await store.commit({ projection: 'p', version: 1, expected: at(3), next: at(5), changes: [change] })).toBe(false);
         expect(await store.commit({ projection: 'p', version: 2, expected: at(4), next: at(5), changes: [change] })).toBe(false);
         expect(store.size('products')).toBe(4);
@@ -97,28 +99,44 @@ describe('statements of es_project', () => {
 
 /**
  * In-memory stand-in for an Elasticsearch cluster: records requests, keeps documents with sequence
- * numbers and emulates the store's update scripts (skip changes older than the document)
+ * numbers, resolves aliases and emulates the store's update scripts (skip changes not newer than
+ * the document's last change)
  */
 class FakeElasticsearch implements ElasticsearchClientLike {
     docs = new Map<string, { source: Record<string, any>; seqNo: number }>();
+    existing = new Set<string>();
+    aliases = new Map<string, string>();
+    requests: Array<[string, any]> = [];
+    private seqNo = 0;
+
     indices = {
-        existing: new Set<string>(),
-        created: [] as unknown[],
-        exists: async ({ index }: { index: string }) => this.indices.existing.has(index),
+        exists: async ({ index }: { index: string }) => this.existing.has(index),
         create: async (params: { index: string }) => {
-            this.indices.created.push(params);
-            this.indices.existing.add(params.index);
+            this.requests.push(['indices.create', params]);
+            this.existing.add(params.index);
+            return {};
+        },
+        delete: async ({ index }: { index: string }) => {
+            this.requests.push(['indices.delete', { index }]);
+            this.dropIndex(index);
+            return {};
+        },
+        updateAliases: async (params: { actions: any[] }) => {
+            this.requests.push(['indices.updateAliases', params]);
+            for (const action of params.actions) {
+                if (action.add) this.aliases.set(action.add.alias, action.add.index);
+                if (action.remove_index) this.dropIndex(action.remove_index.index);
+            }
             return {};
         },
     };
-    requests: Array<[string, any]> = [];
-    private seqNo = 0;
 
     async bulk(params: { operations: any[] }) {
         this.requests.push(['bulk', params]);
         const items: Array<Record<string, { status: number; error?: unknown }>> = [];
         for (let i = 0; i < params.operations.length; i++) {
             const [action, meta] = Object.entries(params.operations[i])[0] as [string, any];
+            this.existing.add(meta._index); // auto-created like in Elasticsearch
             const id = `${meta._index}/${meta._id}`;
             if (action === 'delete') {
                 this.docs.delete(id);
@@ -126,13 +144,14 @@ class FakeElasticsearch implements ElasticsearchClientLike {
                 continue;
             }
             const body = params.operations[++i];
+            const { tx, pos, ord } = body.script.params;
             const current = this.docs.get(id)?.source;
             if (!current) {
                 this.docs.set(id, { source: structuredClone(body.upsert), seqNo: ++this.seqNo });
-            } else if (!(current.es_tx > body.script.params.tx || (current.es_tx === body.script.params.tx && current.es_pos >= body.script.params.pos))) {
+            } else if (!(current.es_tx > tx || (current.es_tx === tx && (current.es_pos > pos || (current.es_pos === pos && current.es_ord >= ord))))) {
                 if (body.script.params.doc) Object.assign(current, body.script.params.doc);
                 for (const [field, value] of Object.entries<number>(body.script.params.values ?? {})) current[field] = (current[field] ?? 0) + value;
-                Object.assign(current, { es_tx: body.script.params.tx, es_pos: body.script.params.pos });
+                Object.assign(current, { es_tx: tx, es_pos: pos, es_ord: ord });
             }
             items.push({ update: { status: 200 } });
         }
@@ -140,7 +159,7 @@ class FakeElasticsearch implements ElasticsearchClientLike {
     }
 
     async get({ index, id }: { index: string; id: string }) {
-        const doc = this.docs.get(`${index}/${id}`);
+        const doc = this.docs.get(`${this.resolve(index)}/${id}`);
         if (!doc) throw Object.assign(new Error('not found'), { meta: { statusCode: 404 } });
         return { found: true, _source: structuredClone(doc.source), _seq_no: doc.seqNo, _primary_term: 1 };
     }
@@ -157,16 +176,25 @@ class FakeElasticsearch implements ElasticsearchClientLike {
 
     async search(params: any) {
         this.requests.push(['search', params]);
+        const index = this.resolve(params.index);
         const hits = [...this.docs.entries()]
-            .filter(([id]) => id.startsWith(`${params.index}/`))
+            .filter(([id]) => id.startsWith(`${index}/`))
             .map(([id, doc]) => ({ _id: id, _source: structuredClone(doc.source) }));
         return { hits: { total: { value: hits.length }, hits } };
     }
 
-    async deleteByQuery(params: any) {
-        this.requests.push(['deleteByQuery', params]);
-        for (const id of this.docs.keys()) if (id.startsWith(`${params.index}/`)) this.docs.delete(id);
-        return {};
+    source(index: string, id: string) {
+        return this.docs.get(`${index}/${id}`)?.source;
+    }
+
+    private resolve(index: string): string {
+        return this.aliases.get(index) ?? index;
+    }
+
+    private dropIndex(index: string): void {
+        this.existing.delete(index);
+        for (const id of this.docs.keys()) if (id.startsWith(`${index}/`)) this.docs.delete(id);
+        for (const [alias, target] of this.aliases) if (target === index) this.aliases.delete(alias);
     }
 }
 
@@ -176,61 +204,114 @@ describe('ElasticsearchReadModelStore', () => {
         search: { fields: ['title'] },
         elasticsearch: { mappings: { properties: { title: { type: 'text' } } } },
     };
+    const change = (op: 'upsert', row: Record<string, unknown>, position: Position, ordinal = 0): ReadModelChange =>
+        ({ op, collection: 'orders', key: { id: row.id }, row, position, ordinal });
 
     function setup() {
         const client = new FakeElasticsearch();
         return { client, store: new ElasticsearchReadModelStore(client, { indexPrefix: 'test-' }) };
     }
 
-    it('creates indices with keyword strings and the given mappings on reset', async () => {
+    it('writes each reset into a new generation of indices behind the alias', async () => {
         const { client, store } = setup();
-        client.indices.existing.add('test-existing');
 
-        expect(await store.reset('p', 1, [orders, { name: 'existing' }])).toBe(true);
+        expect(await store.reset('p', 1, [orders])).toBe(true);
+        const first = client.aliases.get('test-orders')!;
+        expect(first).toMatch(/^test-orders-[a-z0-9]+$/);
+        expect(client.requests).toEqual([
+            ['indices.create', {
+                index: first,
+                mappings: {
+                    dynamic_templates: [{ strings_as_keywords: { match_mapping_type: 'string', mapping: { type: 'keyword', ignore_above: 8191 } } }],
+                    properties: { id: { type: 'keyword' }, es_tx: { type: 'long' }, es_pos: { type: 'long' }, es_ord: { type: 'long' }, title: { type: 'text' } },
+                },
+                settings: undefined,
+            }],
+            ['indices.updateAliases', { actions: [{ add: { index: first, alias: 'test-orders' } }] }],
+        ]);
+        expect(await store.getCheckpoint('p')).toEqual({ version: 1, position: START_POSITION });
 
-        expect(client.indices.created).toEqual([{
-            index: 'test-orders',
-            mappings: {
-                dynamic_templates: [{ strings_as_keywords: { match_mapping_type: 'string', mapping: { type: 'keyword', ignore_above: 8191 } } }],
-                properties: { id: { type: 'keyword' }, es_tx: { type: 'long' }, es_pos: { type: 'long' }, title: { type: 'text' } },
-            },
-            settings: undefined,
+        // Same version without force: already initialized by another process
+        client.requests = [];
+        expect(await store.reset('p', 1, [orders])).toBe(true);
+        expect(client.requests).toEqual([]);
+
+        expect(await store.reset('p', 1, [orders], true)).toBe(true);
+        const second = client.aliases.get('test-orders')!;
+        expect(second).not.toBe(first);
+        expect(client.requests.at(-1)).toEqual(['indices.updateAliases', {
+            actions: [{ add: { index: second, alias: 'test-orders' } }, { remove_index: { index: first } }],
         }]);
-        expect(client.requests).toEqual([['deleteByQuery', { index: 'test-existing', query: { match_all: {} }, refresh: true, conflicts: 'proceed' }]]);
+        expect(client.existing).toEqual(new Set([second]));
+        expect(await store.reset('p', 0, [orders])).toBe(false);
+    });
+
+    it('lets concurrent first resets settle on one generation without deleting each other\'s indices', async () => {
+        const { client, store } = setup();
+        const other = new ElasticsearchReadModelStore(client, { indexPrefix: 'test-' });
+
+        // Both read "no checkpoint"; the second one loses the race to store its checkpoint
+        const index = client.index.bind(client);
+        let raced = false;
+        client.index = async params => {
+            if (!raced) {
+                raced = true;
+                await other.reset('p', 1, [orders]);
+            }
+            return index(params);
+        };
+
+        expect(await store.reset('p', 1, [orders])).toBe(true);
+        expect(client.existing).toEqual(new Set([client.aliases.get('test-orders')]));
         expect(await store.getCheckpoint('p')).toEqual({ version: 1, position: START_POSITION });
     });
 
-    it('writes changes idempotently and moves the checkpoint with optimistic concurrency', async () => {
+    it('applies every change of an event, and a batch written twice only once', async () => {
         const { client, store } = setup();
         await store.reset('p', 1, [orders]);
         const changes: ReadModelChange[] = [
-            { op: 'upsert', collection: 'orders', key: { id: 'o1' }, row: { id: 'o1', title: 'Order', status: 'open' }, position: at(1) },
-            { op: 'increment', collection: 'orders', key: { id: 'o1' }, values: { items: 2 }, position: at(2) },
-            { op: 'upsert', collection: 'orders', key: { id: 'o1' }, row: { id: 'o1', status: 'paid' }, position: at(3) },
+            change('upsert', { id: 'o1', title: 'Order', status: 'open' }, at(1)),
+            { op: 'increment', collection: 'orders', key: { id: 'o1' }, values: { items: 1 }, position: at(1), ordinal: 1 },
+            { op: 'increment', collection: 'orders', key: { id: 'o1' }, values: { items: 1 }, position: at(1), ordinal: 2 },
+            change('upsert', { id: 'o1', status: 'paid' }, at(2)),
         ];
 
-        expect(await store.commit({ projection: 'p', version: 1, expected: START_POSITION, next: at(3), changes })).toBe(true);
+        expect(await store.commit({ projection: 'p', version: 1, expected: START_POSITION, next: at(2), changes })).toBe(true);
         expect(await store.get(orders, { id: 'o1' })).toEqual({ id: 'o1', title: 'Order', status: 'paid', items: 2 });
 
         // The same batch written again by a slower process: documents and checkpoint stay as they are
-        await client.bulk({ operations: (client.requests[0][1] as { operations: unknown[] }).operations });
+        const [, bulk] = client.requests.find(([name]) => name === 'bulk')!;
+        await client.bulk({ operations: bulk.operations });
         expect(await store.get(orders, { id: 'o1' })).toEqual({ id: 'o1', title: 'Order', status: 'paid', items: 2 });
-        expect(await store.commit({ projection: 'p', version: 1, expected: START_POSITION, next: at(3), changes })).toBe(false);
-        expect(await store.getCheckpoint('p')).toEqual({ version: 1, position: at(3) });
+        expect(await store.commit({ projection: 'p', version: 1, expected: START_POSITION, next: at(2), changes })).toBe(false);
+        expect(await store.getCheckpoint('p')).toEqual({ version: 1, position: at(2) });
 
-        const [, bulk] = client.requests[0];
         expect(bulk.refresh).toBe('wait_for');
-        expect(bulk.operations[0]).toEqual({ update: { _index: 'test-orders', _id: 'o1', retry_on_conflict: 3 } });
-        expect(bulk.operations[1].upsert).toEqual({ id: 'o1', title: 'Order', status: 'open', es_tx: 7, es_pos: 1 });
+        expect(bulk.operations[0]).toEqual({ update: { _index: client.aliases.get('test-orders'), _id: 'o1', retry_on_conflict: 3 } });
+        expect(bulk.operations[1].upsert).toEqual({ id: 'o1', title: 'Order', status: 'open', es_tx: 7, es_pos: 1, es_ord: 0 });
+    });
+
+    it('keeps writers of a previous generation away from the new one', async () => {
+        const { client, store } = setup();
+        await store.reset('p', 1, [orders]);
+        const previous = client.aliases.get('test-orders')!;
+        await store.commit({ projection: 'p', version: 1, expected: START_POSITION, next: at(1), changes: [change('upsert', { id: 'o1', v: 1 }, at(1))] });
+        const [, staleBulk] = client.requests.find(([name]) => name === 'bulk')!;
+
+        // A new version rebuilds while a process running the old one is still writing
+        const upgraded = new ElasticsearchReadModelStore(client, { indexPrefix: 'test-' });
+        expect(await upgraded.reset('p', 2, [orders])).toBe(true);
+        await client.bulk({ operations: staleBulk.operations });
+
+        expect(await upgraded.get(orders, { id: 'o1' })).toBeNull();
+        expect(await store.commit({ projection: 'p', version: 1, expected: at(1), next: at(2), changes: [] })).toBe(false);
+        expect(client.source(previous, 'o1')).toMatchObject({ v: 1 }); // orphaned, not read
     });
 
     it('translates queries to the query DSL and hides internal fields', async () => {
         const { client, store } = setup();
         await store.reset('p', 1, [orders]);
-        await store.commit({
-            projection: 'p', version: 1, expected: START_POSITION, next: at(1),
-            changes: [{ op: 'upsert', collection: 'orders', key: { id: 'o1' }, row: { id: 'o1' }, position: at(1) }],
-        });
+        await store.commit({ projection: 'p', version: 1, expected: START_POSITION, next: at(1), changes: [change('upsert', { id: 'o1' }, at(1))] });
 
         const page = await store.find(orders, {
             filter: { status: 'paid', total: { gte: 10, lt: 100 }, tag: { in: ['a', 'b'], neq: 'c' }, deleted_at: null },
@@ -268,20 +349,23 @@ describe('ElasticsearchReadModelStore', () => {
         const { client, store } = setup();
         expect(await store.get(orders, { id: 'missing' })).toBeNull();
         expect(await store.getCheckpoint('p')).toBeNull();
+        expect(await store.commit({ projection: 'p', version: 1, expected: START_POSITION, next: at(1), changes: [] })).toBe(false);
 
+        await store.reset('p', 1, [orders]);
         client.bulk = async () => ({ items: [{ update: { status: 400, error: { type: 'mapper_parsing_exception' } } }] });
         await expect(store.commit({
-            projection: 'p', version: 1, expected: START_POSITION, next: at(1),
-            changes: [{ op: 'upsert', collection: 'orders', key: { id: 'o1' }, row: { id: 'o1' }, position: at(1) }],
+            projection: 'p', version: 1, expected: START_POSITION, next: at(1), changes: [change('upsert', { id: 'o1' }, at(1))],
         })).rejects.toThrow(/mapper_parsing_exception/);
     });
 
     it('uses JSON arrays as ids of composite keys', async () => {
         const { client, store } = setup();
+        await store.reset('p', 1, [{ name: 'lines', key: ['order', 'line'] }]);
         await store.commit({
             projection: 'p', version: 1, expected: START_POSITION, next: at(1),
             changes: [{ op: 'delete', collection: 'lines', key: { order: 'o1', line: 2 }, position: at(1) }],
         });
-        expect(client.requests[0][1].operations).toEqual([{ delete: { _index: 'test-lines', _id: '["o1",2]' } }]);
+        expect(client.requests.find(([name]) => name === 'bulk')![1].operations)
+            .toEqual([{ delete: { _index: client.aliases.get('test-lines'), _id: '["o1",2]' } }]);
     });
 });

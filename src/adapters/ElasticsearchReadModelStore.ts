@@ -4,7 +4,6 @@ import {
     EventStoreError,
     type FieldFilter,
     keyColumns,
-    type Position,
     type ReadModelChange,
     type ReadModelCollection,
     type ReadModelPage,
@@ -53,16 +52,18 @@ export interface ElasticsearchClientLike {
             hits: Array<{ _id?: string | null; _source?: unknown }>;
         };
     }>;
-    deleteByQuery(params: { index: string; query: any; refresh?: boolean; conflicts?: 'abort' | 'proceed' }): Promise<unknown>;
     indices: {
         exists(params: { index: string }): Promise<boolean>;
         create(params: { index: string; mappings?: any; settings?: any }): Promise<unknown>;
+        delete(params: { index: string }): Promise<unknown>;
+        updateAliases(params: { actions: any[] }): Promise<unknown>;
     };
 }
 
 export interface ElasticsearchReadModelStoreOptions {
     indexPrefix?: string; // Prepended to collection names, e.g. 'prod-' (default: '')
-    checkpointIndex?: string; // Index holding the projection checkpoints (default: 'eventstore-projections')
+    /** Index holding the projection checkpoints (default: 'eventstore-projections') */
+    checkpointIndex?: string;
     /**
      * Refresh after each batch: `'wait_for'` (default) makes changes searchable before the commit
      * returns, which read-your-writes needs; `false` gives the highest indexing throughput.
@@ -72,12 +73,16 @@ export interface ElasticsearchReadModelStoreOptions {
 
 interface StoredCheckpoint {
     checkpoint: ProjectionCheckpoint;
+    generation: string; // New for every reset; each generation writes its own indices
     seqNo?: number;
     primaryTerm?: number;
 }
 
-// Position of the last event applied to a document: guards against applying older changes again
-const POSITION_FIELDS = ['es_tx', 'es_pos'] as const;
+// Last change applied to a document (event position and the change's ordinal within the event):
+// guards against applying older changes again
+const POSITION_FIELDS = ['es_tx', 'es_pos', 'es_ord'] as const;
+
+const RESET_ATTEMPTS = 5;
 
 const SKIP_OLDER = `
 def s = ctx._source;
@@ -85,13 +90,17 @@ boolean older = false;
 if (s.es_tx != null) {
   long tx = ((Number) s.es_tx).longValue();
   long pos = ((Number) s.es_pos).longValue();
+  long ord = s.es_ord == null ? 0 : ((Number) s.es_ord).longValue();
   long ptx = ((Number) params.tx).longValue();
   long ppos = ((Number) params.pos).longValue();
-  older = tx > ptx || (tx == ptx && pos >= ppos);
+  long pord = ((Number) params.ord).longValue();
+  older = tx > ptx || (tx == ptx && (pos > ppos || (pos == ppos && ord >= pord)));
 }`;
 
+const STAMP = 's.es_tx = params.tx; s.es_pos = params.pos; s.es_ord = params.ord;';
+
 const UPSERT_SCRIPT = `${SKIP_OLDER}
-if (older) { ctx.op = 'noop'; } else { s.putAll(params.doc); s.es_tx = params.tx; s.es_pos = params.pos; }`;
+if (older) { ctx.op = 'noop'; } else { s.putAll(params.doc); ${STAMP} }`;
 
 const INCREMENT_SCRIPT = `${SKIP_OLDER}
 if (older) { ctx.op = 'noop'; } else {
@@ -99,17 +108,21 @@ if (older) { ctx.op = 'noop'; } else {
     def value = s[entry.getKey()];
     s[entry.getKey()] = (value == null ? 0 : value) + entry.getValue();
   }
-  s.es_tx = params.tx; s.es_pos = params.pos;
+  ${STAMP}
 }`;
 
 /**
  * Adapter: Elasticsearch Read Model Store
  *
  * Read models are indices; each row is a document whose id is its key. Elasticsearch has no
- * transactions, so changes are written idempotently instead: every document remembers the
- * position of the last event applied to it and older changes are skipped. A batch that is
- * written twice (after a crash, or by two processes) therefore has no further effect.
- * Deletes are not guarded: run one projector per Elasticsearch projection if it deletes.
+ * transactions, so changes are written idempotently instead: every document remembers the last
+ * change applied to it and older changes are skipped. A batch that is written twice (after a
+ * crash, or by two processes) therefore has no further effect. Deletes are not guarded: run one
+ * projector per Elasticsearch projection if it deletes.
+ *
+ * Queries read the alias `<indexPrefix><collection>`. Every reset (new projection, version bump,
+ * rebuild) writes a new generation of indices (`<alias>-<generation>`) and moves the alias to it,
+ * so processes still writing the previous generation cannot affect the new one.
  */
 export class ElasticsearchReadModelStore implements IReadModelStore {
     private readonly prefix: string;
@@ -128,45 +141,57 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
 
     async commit(commit: ProjectionCommit): Promise<boolean> {
         const stored = await this.readCheckpoint(commit.projection);
-        const current = stored?.checkpoint ?? { version: commit.version, position: START_POSITION };
-        if (current.version !== commit.version || comparePositions(current.position, commit.expected) !== 0) return false;
+        if (!stored) return false;
+        const { checkpoint, generation } = stored;
+        if (checkpoint.version !== commit.version || comparePositions(checkpoint.position, commit.expected) !== 0) return false;
 
         if (commit.changes.length > 0) {
             const response = await this.client.bulk({
-                operations: commit.changes.flatMap(change => this.operations(change)),
+                operations: commit.changes.flatMap(change => this.operations(change, generation)),
                 refresh: this.refresh,
             });
             const failed = response.items.map(item => Object.values(item)[0]).find(result => result?.error);
             if (failed) throw new EventStoreError(`Elasticsearch rejected a read model change: ${JSON.stringify(failed.error)}`, failed.error);
         }
 
-        return this.writeCheckpoint(commit.projection, { version: commit.version, position: commit.next }, stored);
+        return this.writeCheckpoint(commit.projection, { version: commit.version, position: commit.next }, generation, stored);
     }
 
     async reset(projection: string, version: number, collections: readonly ReadModelCollection[], force = false): Promise<boolean> {
-        const stored = await this.readCheckpoint(projection);
-        if (stored && stored.checkpoint.version > version) return false;
-        if (stored?.checkpoint.version === version && !force) return true;
+        for (let attempt = 1; ; attempt++) {
+            const stored = await this.readCheckpoint(projection);
+            if (stored && stored.checkpoint.version > version) return false;
+            if (stored?.checkpoint.version === version && !force) return true;
 
-        for (const collection of collections) {
-            const index = this.indexName(collection.name);
-            if (await this.client.indices.exists({ index })) {
-                await this.client.deleteByQuery({ index, query: { match_all: {} }, refresh: true, conflicts: 'proceed' });
-            } else {
-                await this.client.indices.create({
-                    index,
-                    mappings: mappingsOf(collection),
-                    settings: collection.elasticsearch?.settings,
-                });
+            // Unique per attempt, so concurrent resets never touch each other's indices
+            const generation = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+            const indices = collections.map(collection => this.physicalIndex(collection.name, generation));
+            for (const [i, collection] of collections.entries()) {
+                await this.client.indices.create({ index: indices[i], mappings: mappingsOf(collection), settings: collection.elasticsearch?.settings });
             }
-        }
 
-        return this.writeCheckpoint(projection, { version, position: START_POSITION }, stored);
+            if (!(await this.writeCheckpoint(projection, { version, position: START_POSITION }, generation, stored))) {
+                // Another process committed or reset in the meantime: start over from its checkpoint
+                for (const index of indices) await this.client.indices.delete({ index });
+                if (attempt < RESET_ATTEMPTS) continue;
+                throw new EventStoreError(`Failed to reset projection ${projection}: its checkpoint keeps changing`);
+            }
+
+            // Move the aliases and drop the previous generation in one atomic step
+            const actions: unknown[] = [];
+            for (const collection of collections) {
+                actions.push({ add: { index: this.physicalIndex(collection.name, generation), alias: this.aliasName(collection.name) } });
+                const previous = stored && this.physicalIndex(collection.name, stored.generation);
+                if (previous && await this.client.indices.exists({ index: previous })) actions.push({ remove_index: { index: previous } });
+            }
+            await this.client.indices.updateAliases({ actions });
+            return true;
+        }
     }
 
     async get<T = ReadModelRow>(collection: ReadModelCollection, key: ReadModelRow): Promise<T | null> {
         try {
-            const response = await this.client.get({ index: this.indexName(collection.name), id: documentId(key) });
+            const response = await this.client.get({ index: this.aliasName(collection.name), id: documentId(key) });
             return response.found ? withoutPosition(response._source) as T : null;
         } catch (err) {
             if (statusOf(err) === 404) return null;
@@ -202,7 +227,7 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
 
         try {
             const response = await this.client.search({
-                index: this.indexName(collection.name),
+                index: this.aliasName(collection.name),
                 query: { bool: { filter, must, must_not: mustNot } },
                 sort: query.sort?.map(({ field, order }) => ({ [field]: { order: order ?? 'asc' } })),
                 from: query.offset ?? 0,
@@ -221,9 +246,10 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
         }
     }
 
-    private operations(change: ReadModelChange): unknown[] {
-        const target = { _index: this.indexName(change.collection), _id: documentId(change.key) };
-        const params = toParams(change.position);
+    private operations(change: ReadModelChange, generation: string): unknown[] {
+        const target = { _index: this.physicalIndex(change.collection, generation), _id: documentId(change.key) };
+        const params = toParams(change);
+        const stamp = { es_tx: params.tx, es_pos: params.pos, es_ord: params.ord };
 
         switch (change.op) {
             case 'upsert':
@@ -231,7 +257,7 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
                     { update: { ...target, retry_on_conflict: 3 } },
                     {
                         script: { source: UPSERT_SCRIPT, params: { ...params, doc: change.row } },
-                        upsert: { ...change.row, es_tx: params.tx, es_pos: params.pos },
+                        upsert: { ...change.row, ...stamp },
                     },
                 ];
             case 'increment':
@@ -239,7 +265,7 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
                     { update: { ...target, retry_on_conflict: 3 } },
                     {
                         script: { source: INCREMENT_SCRIPT, params: { ...params, values: change.values } },
-                        upsert: { ...change.key, ...change.values, es_tx: params.tx, es_pos: params.pos },
+                        upsert: { ...change.key, ...change.values, ...stamp },
                     },
                 ];
             case 'delete':
@@ -252,12 +278,13 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
             const response = await this.client.get({ index: this.checkpointIndex, id: projection });
             if (!response.found) return null;
 
-            const source = response._source as { version: number; transaction_id: string; global_position: number };
+            const source = response._source as { version: number; transaction_id: string; global_position: number; generation?: string };
             return {
                 checkpoint: {
                     version: source.version,
                     position: { transactionId: String(source.transaction_id), globalPosition: Number(source.global_position) },
                 },
+                generation: source.generation ?? '',
                 seqNo: response._seq_no,
                 primaryTerm: response._primary_term,
             };
@@ -270,7 +297,12 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
     /**
      * Store a checkpoint unless it changed since it was read (optimistic concurrency control)
      */
-    private async writeCheckpoint(projection: string, checkpoint: ProjectionCheckpoint, stored: StoredCheckpoint | null): Promise<boolean> {
+    private async writeCheckpoint(
+        projection: string,
+        checkpoint: ProjectionCheckpoint,
+        generation: string,
+        stored: StoredCheckpoint | null
+    ): Promise<boolean> {
         try {
             await this.client.index({
                 index: this.checkpointIndex,
@@ -279,6 +311,7 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
                     version: checkpoint.version,
                     transaction_id: checkpoint.position.transactionId,
                     global_position: checkpoint.position.globalPosition,
+                    generation,
                     updated_at: new Date().toISOString(),
                 },
                 ...(stored?.seqNo !== undefined && stored.primaryTerm !== undefined
@@ -292,8 +325,14 @@ export class ElasticsearchReadModelStore implements IReadModelStore {
         }
     }
 
-    private indexName(collection: string): string {
+    /** Alias that queries read */
+    private aliasName(collection: string): string {
         return this.prefix + collection;
+    }
+
+    /** Index of one generation, written by projections */
+    private physicalIndex(collection: string, generation: string): string {
+        return `${this.aliasName(collection)}-${generation}`;
     }
 }
 
@@ -320,13 +359,14 @@ function mappingsOf(collection: ReadModelCollection): Record<string, unknown> {
             ...keyProperties,
             es_tx: { type: 'long' },
             es_pos: { type: 'long' },
+            es_ord: { type: 'long' },
             ...(custom.properties as Record<string, unknown> | undefined),
         },
     };
 }
 
-function toParams(position: Position): { tx: number; pos: number } {
-    return { tx: Number(position.transactionId), pos: position.globalPosition };
+function toParams(change: ReadModelChange): { tx: number; pos: number; ord: number } {
+    return { tx: Number(change.position.transactionId), pos: change.position.globalPosition, ord: change.ordinal ?? 0 };
 }
 
 function withoutPosition(source: unknown): ReadModelRow {

@@ -28,8 +28,8 @@ export class MemoryReadModelStore implements IReadModelStore {
     }
 
     async commit(commit: ProjectionCommit): Promise<boolean> {
-        const current = this.checkpoints.get(commit.projection) ?? { version: commit.version, position: START_POSITION };
-        if (current.version !== commit.version || comparePositions(current.position, commit.expected) !== 0) return false;
+        const current = this.checkpoints.get(commit.projection);
+        if (!current || current.version !== commit.version || comparePositions(current.position, commit.expected) !== 0) return false;
 
         for (const change of commit.changes) {
             const rows = this.rows(change.collection);
