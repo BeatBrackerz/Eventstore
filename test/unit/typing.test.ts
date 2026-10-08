@@ -1,9 +1,16 @@
+import {Client as ElasticsearchClient} from '@elastic/elasticsearch';
 import {createClient} from '@supabase/supabase-js';
 import {Cluster, Redis} from 'ioredis';
 import {describe, expect, it} from 'vitest';
-import {createEventStore, RedisCacheService, type RedisClientLike} from '../../src/index.js';
+import {
+    createEventStore,
+    type ElasticsearchClientLike,
+    ElasticsearchReadModelStore,
+    RedisCacheService,
+    type RedisClientLike,
+} from '../../src/index.js';
 
-// Checked by `npm run typecheck`: ioredis clients and generated Supabase types must be accepted without casts
+// Checked by `npm run typecheck`: ioredis and Elasticsearch clients and generated Supabase types must be accepted without casts
 interface Database {
     public: {
         Tables: {
@@ -39,5 +46,18 @@ describe('type compatibility', () => {
 
         redis.disconnect();
         cluster.disconnect();
+    });
+
+    it('accepts the official Elasticsearch client', async () => {
+        const elasticsearch = new ElasticsearchClient({ node: 'http://127.0.0.1:1' });
+        const client: ElasticsearchClientLike = elasticsearch;
+        const store = createEventStore({
+            supabase: createClient('http://127.0.0.1:1', 'key', { auth: { persistSession: false, autoRefreshToken: false } }),
+            readModelStore: new ElasticsearchReadModelStore(elasticsearch),
+        });
+
+        expect(client).toBe(elasticsearch);
+        expect(store.readModels).toBeDefined();
+        await elasticsearch.close();
     });
 });

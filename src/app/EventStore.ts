@@ -5,14 +5,16 @@ import {
     EventProjection,
     EventRecord,
     EventStoreError,
-    QueryEventsOptions, RedisClientLike, ReplayOptions, SnapshotRecord
+    type Position,
+    QueryEventsOptions, RedisClientLike, ReplayOptions, SnapshotRecord,
+    START_POSITION
 } from "../domain/index.js";
 import {
     MemoryCacheService,
     NoOpCacheService,
     RedisCacheService,
     SupabaseEventPublisher,
-    SupabaseEventRepository, SupabaseSequenceRepository,
+    SupabaseEventRepository, SupabaseReadModelStore, SupabaseSequenceRepository,
     SupabaseSnapshotRepository
 } from "../adapters/index.js";
 import type {
@@ -20,12 +22,15 @@ import type {
     ICacheService,
     IEventPublisher,
     IEventRepository,
+    IReadModelStore,
     ISequenceRepository,
     ISnapshotRepository,
-    LoadedStream
+    LoadedStream,
+    ReadAllResult
 } from "../ports/index.js";
 import {AggregateCache, type AggregateRef, type Freshness, lastSequence, sliceStream, type StreamEntry} from "./AggregateCache.js";
 import {cloneJson, SingleFlight} from "./SingleFlight.js";
+import {type ProjectionDefinition, ProjectionEngine, type ProjectionOptions, ReadModels} from "./ProjectionEngine.js";
 
 /**
  * Event Store Service Configuration
@@ -37,17 +42,33 @@ export interface EventStoreConfig {
     cacheService: ICacheService;
     eventPublisher?: IEventPublisher;
     cache?: CacheConfig; // TTLs, key prefix and consistency of the cache
+    readModelStore?: IReadModelStore; // Default store of projections and read model queries
+    projections?: readonly ProjectionDefinition[];
+    projectionOptions?: ProjectionOptions;
 }
 
 /**
  * Event Store Service - Core Business Logic
  */
 export class EventStore {
+    /** Projections: catch up, rebuild, run in the background, status */
+    readonly projections: ProjectionEngine;
+    /** Queries of read models (the write side's read tables and search indices) */
+    readonly readModels: ReadModels;
+
     private readonly cache: AggregateCache;
     private readonly flights = new SingleFlight();
 
     constructor(private readonly config: EventStoreConfig) {
         this.cache = new AggregateCache(config.cacheService, config.cache);
+        this.projections = new ProjectionEngine(
+            config.eventRepository,
+            config.readModelStore,
+            config.projections,
+            config.projectionOptions,
+            config.eventPublisher
+        );
+        this.readModels = new ReadModels(this.projections);
     }
 
     // ============================================================================
@@ -73,6 +94,7 @@ export class EventStore {
             }
 
             await this.cache.afterAppend([savedEvent]);
+            await this.projections.afterAppend([savedEvent]);
 
             return savedEvent;
         } catch (err) {
@@ -96,6 +118,7 @@ export class EventStore {
             }
 
             await this.cache.afterAppend(savedEvents);
+            await this.projections.afterAppend(savedEvents);
 
             return savedEvents;
         } catch (err) {
@@ -187,6 +210,29 @@ export class EventStore {
         } catch (err) {
             if (err instanceof EventStoreError) throw err;
             throw new EventStoreError('Failed to get current sequence number', err);
+        }
+    }
+
+    /**
+     * Read events of all aggregates in commit order, e.g. to feed other systems. Continue with
+     * `result.next` until `result.done` (requires sql/eventstore.sql).
+     */
+    async readAll(
+        after: Position = START_POSITION,
+        options: { limit?: number; eventTypes?: readonly string[]; aggregateTypes?: readonly string[] } = {}
+    ): Promise<ReadAllResult> {
+        try {
+            const result = await this.config.eventRepository.readAll?.({
+                after,
+                limit: options.limit ?? 1000,
+                eventTypes: options.eventTypes,
+                aggregateTypes: options.aggregateTypes,
+            });
+            if (!result) throw new EventStoreError('readAll needs the database function es_read_all: run sql/eventstore.sql');
+            return result;
+        } catch (err) {
+            if (err instanceof EventStoreError) throw err;
+            throw new EventStoreError('Failed to read events', err);
         }
     }
 
@@ -899,6 +945,9 @@ export interface EventStoreBuilderConfig {
     enablePublisher?: boolean;
     rpc?: boolean | 'auto'; // Use the database functions from sql/eventstore.sql (default: 'auto')
     pageSize?: number; // Rows per request when paginating, at most PostgREST's max-rows (default: 1000)
+    projections?: readonly ProjectionDefinition[]; // Projections keeping read models up to date
+    readModelStore?: IReadModelStore; // Default store of read models (default: tables in Supabase)
+    projectionOptions?: ProjectionOptions;
 }
 
 /**
@@ -928,6 +977,9 @@ export function createEventStore(config: EventStoreBuilderConfig): EventStore {
         cacheService,
         eventPublisher,
         cache: config.cache,
+        readModelStore: config.readModelStore ?? new SupabaseReadModelStore(config.supabase, { pageSize: config.pageSize }),
+        projections: config.projections,
+        projectionOptions: config.projectionOptions,
     });
 }
 

@@ -1,3 +1,4 @@
+import {execFileSync} from 'node:child_process';
 import {createHmac} from 'node:crypto';
 import http from 'node:http';
 import type {AddressInfo} from 'node:net';
@@ -12,6 +13,17 @@ export function integrationEnv() {
     const legacyUrl = process.env.EVENTSTORE_IT_POSTGREST_LEGACY_URL;
     const jwtSecret = process.env.EVENTSTORE_IT_JWT_SECRET;
     return url && legacyUrl && jwtSecret ? { url, legacyUrl, jwtSecret } : requireEnv('EVENTSTORE_IT_POSTGREST_*');
+}
+
+/**
+ * Direct database access with psql (connection via the usual PG* environment variables), for
+ * tests that need their own transactions or databases
+ */
+export function postgresEnv(): { psql: (database: string, sql: string) => string } | undefined {
+    if (!process.env.PGHOST) return requireEnv('PGHOST (psql access)');
+    return {
+        psql: (database, sql) => execFileSync('psql', ['-v', 'ON_ERROR_STOP=1', '-qAt', '-d', database, '-c', sql], { encoding: 'utf8' }).trim(),
+    };
 }
 
 export function redisUrl(): string | undefined {
@@ -96,8 +108,8 @@ export class RestProxy {
     }
 }
 
-export function serviceRoleClient(url: string, jwtSecret: string): SupabaseClient {
-    return createClient(url, signJwt({ role: 'service_role' }, jwtSecret), {
+export function serviceRoleClient(url: string, jwtSecret: string, role = 'service_role'): SupabaseClient {
+    return createClient(url, signJwt({ role }, jwtSecret), {
         auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
     });
 }

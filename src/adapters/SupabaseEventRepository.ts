@@ -1,5 +1,5 @@
 import {CreateEventInput, EventRecord, EventStoreError, QueryEventsOptions} from "../domain/index.js";
-import type {AggregateStatsData, IEventRepository, LoadedStream, StreamQuery} from "../ports/index.js";
+import type {AggregateStatsData, IEventRepository, LoadedStream, ReadAllQuery, ReadAllResult, StreamQuery} from "../ports/index.js";
 import {type AnySupabaseClient, DEFAULT_PAGE_SIZE, RpcSupport, type SupabaseAdapterOptions} from "./supabaseSupport.js";
 
 type EventFilters = Omit<QueryEventsOptions, 'limit' | 'order'>;
@@ -135,6 +135,29 @@ export class SupabaseEventRepository implements IEventRepository {
             p_aggregate_id: aggregateId,
             p_aggregate_type: aggregateType,
         });
+    }
+
+    /**
+     * Events of all aggregates in commit order (requires `es_read_all`)
+     */
+    async readAll(query: ReadAllQuery): Promise<ReadAllResult | undefined> {
+        const result = await this.rpc.call<{ events: EventRecord[]; next: { transaction_id: string; global_position: number }; done: boolean }>(
+            'es_read_all',
+            {
+                p_after_transaction_id: query.after.transactionId,
+                p_after_position: query.after.globalPosition,
+                p_limit: query.limit,
+                p_event_types: query.eventTypes ?? null,
+                p_aggregate_types: query.aggregateTypes ?? null,
+            }
+        );
+        if (!result) return undefined;
+
+        return {
+            events: result.events,
+            next: { transactionId: result.next.transaction_id, globalPosition: Number(result.next.global_position) },
+            done: result.done,
+        };
     }
 
     private async fetchPages(filters: EventFilters, sort: SortKey[], offset: number, limit?: number): Promise<EventRecord[]> {

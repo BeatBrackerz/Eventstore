@@ -26,6 +26,10 @@ export interface EventRecord {
     metadata: EventMetadata;
     created_at: string;
     created_by: string;
+    /** Id of the writing transaction, as a decimal string (with sql/eventstore.sql); orders events by commit */
+    transaction_id?: string;
+    /** Position among all events (with sql/eventstore.sql); orders events by commit together with transaction_id */
+    global_position?: number;
 }
 
 /**

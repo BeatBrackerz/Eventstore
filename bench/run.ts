@@ -178,4 +178,74 @@ for (const scenario of scenarios) {
     console.log('');
 }
 
+// ============================================================================
+// Read models: list queries served by a projection instead of replaying aggregates
+// ============================================================================
+
+const ORDERS = 20;
+const EVENTS_PER_ORDER = 10;
+const customer = `bench-${randomUUID()}`;
+const summaries = {
+    name: `bench-summaries-${randomUUID()}`,
+    collections: ['it_order_summaries'],
+    aggregateTypes: ['bench-order'],
+    handlers: {
+        BenchOrderCreated: (e: any, ctx: any) => ctx.upsert('it_order_summaries', { id: e.aggregate_id, customer: e.payload.customer }),
+        BenchItemAdded: (e: any, ctx: any) => ctx.increment('it_order_summaries', e.aggregate_id, { items: 1, total: e.payload.price }),
+    },
+};
+const orderEvents = (id: string) => [
+    { type: 'BenchOrderCreated', aggregate_id: id, aggregate_type: 'bench-order', created_by: USER, payload: { customer } },
+    ...Array.from({ length: EVENTS_PER_ORDER - 1 }, () => (
+        { type: 'BenchItemAdded', aggregate_id: id, aggregate_type: 'bench-order', created_by: USER, payload: { price: 10 } }
+    )),
+];
+const summary = {
+    initialState: { items: 0, total: 0 },
+    applyEvent: (state: { items: number; total: number }, e: any) =>
+        e.type === 'BenchItemAdded' ? { items: state.items + 1, total: state.total + e.payload.price } : state,
+};
+
+const functionsVariant = variants.find(variant => variant.proxy === functionsProxy && variant.name === 'new, with SQL migration')!;
+const withProjection = (mode: 'inline' | 'async') =>
+    current.createEventStore({ supabase: functionsClient, projections: [{ ...summaries, mode }] });
+
+functionsProxy.latencyMs = 0;
+const writer = withProjection('inline');
+const orderIds = Array.from({ length: ORDERS }, () => randomUUID());
+for (const id of orderIds) await writer.appendEvents(orderEvents(id));
+
+const readModelRows: Array<[string, Measurement]> = [
+    [
+        `List ${ORDERS} orders by replaying each aggregate (${EVENTS_PER_ORDER} events, first time)`,
+        await measure(functionsVariant, 1, async () => {
+            const store = current.createEventStore({ supabase: functionsClient });
+            await Promise.all(orderIds.map(id => store.replayEvents(id, 'bench-order', summary)));
+        }),
+    ],
+    [
+        `List ${ORDERS} orders from the read model (readModels.find)`,
+        await measure(functionsVariant, 10, async () => {
+            const page = await writer.readModels.find('it_order_summaries', { filter: { customer }, sort: [{ field: 'id' }], limit: ORDERS });
+            return `${page.items.length} rows`;
+        }),
+    ],
+    [
+        'Append one event, inline projection (read-your-writes)',
+        await measure(functionsVariant, 20, () => writer.appendEvent(orderEvents(orderIds[0])[1]).then(() => undefined)),
+    ],
+    [
+        'Append one event, async projection',
+        await measure(functionsVariant, 20, () => withProjection('async').appendEvent(orderEvents(orderIds[0])[1]).then(() => undefined)),
+    ],
+];
+
+console.log('### Read models (with SQL migration)\n');
+console.log('| Operation | Time | Requests | Transferred | |');
+console.log('|---|---:|---:|---:|---|');
+for (const [title, m] of readModelRows) {
+    console.log(`| ${title} | ${m.ms.toFixed(1)} ms | ${m.requests.toFixed(1)} | ${m.kb.toFixed(1)} KB | ${m.note ?? ''} |`);
+}
+console.log('');
+
 await Promise.all([functionsProxy.stop(), legacyProxy.stop()]);
