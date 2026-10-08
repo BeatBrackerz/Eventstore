@@ -48,8 +48,14 @@ const summaries = (name: string, overrides: Partial<ProjectionDefinition> = {}):
     ...overrides,
 });
 
-describe.skipIf(!env)('projections against PostgREST', () => {
-    const proxy = new RestProxy(env?.url ?? '');
+// The same tests against a plain and a partitioned events table (with immutable, audited events)
+const targets = [
+    { name: 'plain', url: env?.url ?? '', database: 'es_it' },
+    { name: 'partitioned', url: env?.partitionedUrl ?? '', database: 'es_it_partitioned' },
+];
+
+describe.skipIf(!env).each(targets)('projections against PostgREST ($name events table)', target => {
+    const proxy = new RestProxy(target.url);
     let client: SupabaseClient;
     let url: string;
     const errors: ProjectionError[] = [];
@@ -244,10 +250,10 @@ describe.skipIf(!env)('projections against PostgREST', () => {
             // An append that stays uncommitted for a moment
             const slow = randomUUID();
             const events = JSON.stringify([event('Slow', slow)]);
-            const psql = spawn('psql', ['-v', 'ON_ERROR_STOP=1', '-qAt', '-d', 'es_it', '-c',
+            const psql = spawn('psql', ['-v', 'ON_ERROR_STOP=1', '-qAt', '-d', target.database, '-c',
                 `begin; select count(*) from json_array_elements(public.es_append_events('${events}'::jsonb)); select pg_sleep(1.5); commit;`]);
             const exited = new Promise<number | null>(resolve => psql.on('exit', resolve));
-            await waitUntil(() => pg!.psql('es_it', `select count(*) from pg_stat_activity where query like '%pg_sleep(1.5)%' and state = 'active' and pid <> pg_backend_pid()`) === '1');
+            await waitUntil(() => pg!.psql(target.database, `select count(*) from pg_stat_activity where datname = current_database() and query like '%pg_sleep(1.5)%' and state = 'active' and pid <> pg_backend_pid()`) === '1');
 
             const fast = await es.appendEvent(event('Fast', randomUUID()));
             const during = await es.readAll(after);
@@ -269,14 +275,14 @@ describe.skipIf(!env)('projections against PostgREST', () => {
 
             // Another append holds the lock of b for a moment
             const events = JSON.stringify([event('B0', b)]);
-            const psql = spawn('psql', ['-v', 'ON_ERROR_STOP=1', '-qAt', '-d', 'es_it', '-c',
+            const psql = spawn('psql', ['-v', 'ON_ERROR_STOP=1', '-qAt', '-d', target.database, '-c',
                 `begin; select count(*) from json_array_elements(public.es_append_events('${events}'::jsonb)); select pg_sleep(1.5); commit;`]);
             const exited = new Promise<number | null>(resolve => psql.on('exit', resolve));
-            await waitUntil(() => pg!.psql('es_it', `select count(*) from pg_stat_activity where query like '%pg_sleep(1.5)%' and state = 'active' and pid <> pg_backend_pid()`) === '1');
+            await waitUntil(() => pg!.psql(target.database, `select count(*) from pg_stat_activity where datname = current_database() and query like '%pg_sleep(1.5)%' and state = 'active' and pid <> pg_backend_pid()`) === '1');
 
             // A batch over a, b and x gets its transaction id with a, then waits for b ...
             const batch = es.appendEvents([event('A1', a), event('B1', b), event('X2', x)]);
-            await waitUntil(() => pg!.psql('es_it', `select count(*) from pg_stat_activity where query like '%es_append_events%' and wait_event_type = 'Lock' and pid <> pg_backend_pid()`) === '1');
+            await waitUntil(() => pg!.psql(target.database, `select count(*) from pg_stat_activity where datname = current_database() and query like '%es_append_events%' and wait_event_type = 'Lock' and pid <> pg_backend_pid()`) === '1');
 
             // ... while x's first event is appended and committed by a later transaction
             const first = await es.appendEvent(event('X1', x));
@@ -289,7 +295,7 @@ describe.skipIf(!env)('projections against PostgREST', () => {
             expect(ofX.map(e => e.type)).toEqual(['X1', 'X2']);
         });
 
-        it('upgrades an existing events table and keeps every aggregate in sequence order', () => {
+        it.skipIf(target.name !== 'plain')('upgrades an existing events table and keeps every aggregate in sequence order', () => {
             pg!.psql('postgres', 'drop database if exists es_it_upgrade');
             pg!.psql('postgres', 'create database es_it_upgrade');
             pg!.psql('es_it_upgrade', readFileSync('test/integration/legacy-schema.sql', 'utf8'));

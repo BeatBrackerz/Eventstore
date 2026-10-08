@@ -11,8 +11,11 @@ import {createClient, type SupabaseClient} from '@supabase/supabase-js';
 export function integrationEnv() {
     const url = process.env.EVENTSTORE_IT_POSTGREST_URL;
     const legacyUrl = process.env.EVENTSTORE_IT_POSTGREST_LEGACY_URL;
+    const partitionedUrl = process.env.EVENTSTORE_IT_POSTGREST_PARTITIONED_URL;
     const jwtSecret = process.env.EVENTSTORE_IT_JWT_SECRET;
-    return url && legacyUrl && jwtSecret ? { url, legacyUrl, jwtSecret } : requireEnv('EVENTSTORE_IT_POSTGREST_*');
+    return url && legacyUrl && partitionedUrl && jwtSecret
+        ? { url, legacyUrl, partitionedUrl, jwtSecret }
+        : requireEnv('EVENTSTORE_IT_POSTGREST_*');
 }
 
 /**

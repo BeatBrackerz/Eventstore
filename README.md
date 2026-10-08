@@ -41,7 +41,7 @@ flowchart LR
 - [Write side: events, aggregates, snapshots](#write-side-events-aggregates-snapshots)
 - [Read side: projections and read models (CQRS)](#read-side-projections-and-read-models-cqrs)
 - [Elasticsearch (optional)](#elasticsearch-optional)
-- [Supabase database: setup and optimizations](#supabase-database-setup-and-optimizations)
+- [Supabase database: setup and optimizations](#supabase-database-setup-and-optimizations) – incl. [monthly partitions](#monthly-partitions-optional) and [audit logging](#immutable-events-and-audit-logging-optional)
 - [Caching & consistency of aggregate reads](#caching--consistency-of-aggregate-reads)
 - [Performance](#performance)
 - [Architecture](#architecture)
@@ -70,6 +70,7 @@ flowchart LR
 - In-memory cache for aggregate reads, Redis optional; incremental loading; concurrent identical reads share one request
 - Database functions: appends and aggregate loads in one round trip, statistics computed in the database
 - Write-optimized schema: time-ordered UUIDs, lz4 compression, tuned autovacuum, HOT updates, report of redundant indexes
+- Optional: monthly partitions of the events table, immutable events and audit logging with pgaudit
 
 **Architecture**
 - Ports & Adapters, every adapter replaceable (custom databases, caches, read model stores), fully typed
@@ -532,14 +533,15 @@ The official client satisfies the store's minimal client interface structurally 
 | Tables | `events`, `aggregate_sequences`, `snapshots`, `es_projections` (created if missing) | Event store and projection checkpoints |
 | Commit order | `events.transaction_id` (`xid8`) and `events.global_position` (identity) + index | Projections read all events in commit order without skipping any |
 | Appends | `es_append_events`: sequence numbers and insert in **one request**, locking per aggregate; within each aggregate, commit order follows the sequence numbers (a batch that would break it fails with `40001` and is retried automatically) | 3 → 1 round trips, no duplicate sequence numbers under concurrency, projections see every aggregate in order |
-| Reads | `es_load_stream`, `es_aggregate_stats` | Snapshot + events in one request; statistics without transferring the stream |
+| Reads | `es_load_stream`, `es_aggregate_stats`; `aggregate_sequences.first_created_at` records when each aggregate started | Snapshot + events in one request; statistics without transferring the stream; on partitioned tables, months before the aggregate existed are skipped |
 | Projections | `es_read_all`, `es_project`, `es_reset_projection`, view `es_projection_status` | Commit-order reads; changes + checkpoint in one transaction; rebuilds; monitoring |
 | Ids | `es_uuid_v7()` as default of `events.id` and `snapshots.id` (replaces `gen_random_uuid()`) | Time-ordered ids are appended at the end of the primary key index instead of random pages: smaller index, fewer page writes and WAL |
 | Compression | `lz4` for `payload`, `metadata`, `state` | Compresses and decompresses large JSON several times faster than the default `pglz` |
 | Autovacuum | `events`: insert-triggered vacuum at 5 %, analyze at 2 % | Append-only tables are frozen in small steps instead of large bursts; current planner statistics |
 | HOT updates | `aggregate_sequences` `fillfactor = 80`, `es_projections` `fillfactor = 50` | Rows updated on every append / batch are rewritten in place without index updates |
 | Indexes | Unique `(aggregate_id, aggregate_type, sequence_number)`, `(type, created_at)`, `(transaction_id, global_position)`; a **notice** for redundant indexes | Every index costs on every append; drop the reported ones |
-| Security | Functions run as the caller (`SECURITY INVOKER`, fixed `search_path`); projection functions and `es_projection_status` only for `service_role`; RLS on `es_projections`; a **warning** if `events`, `snapshots` or `aggregate_sequences` are reachable with the anon key | Grants and RLS apply as for direct table access; nothing new is exposed to browsers |
+| Security | Functions run as the caller (`SECURITY INVOKER`, fixed `search_path`); projection functions and `es_projection_status` only for `service_role`; administration functions only for the table owner; RLS on `es_projections`; a **warning** if `events`, `snapshots` or `aggregate_sequences` are reachable with the anon key | Grants and RLS apply as for direct table access; nothing new is exposed to browsers |
+| Optional | `es_partition_events()`, `es_enable_audit()` / `es_protect_events()` – see [below](#monthly-partitions-optional) | Not enabled by the script; call them once if you want them |
 
 ### The write path
 
@@ -562,9 +564,67 @@ sequenceDiagram
 - **Read tables:** one index per filter combination you query, a generated `tsvector` column with a GIN index for search, `fillfactor = 90` for rows that change often, RLS policies with `(select auth.uid())`.
 - **Check the advisors** in the Supabase dashboard (Database → Advisors) after migrations, and `pg_stat_statements` for slow queries.
 
+### Monthly partitions (optional)
+
+```sql
+select public.es_partition_events();   -- once, in the SQL editor (as postgres)
+```
+
+```mermaid
+flowchart LR
+    app["es_append_events<br/>es_load_stream · es_read_all"] --> events["events<br/>partitioned by month of created_at"]
+    events --> legacy[("events_legacy<br/>everything before the conversion")]
+    events --> m1[("events_y2026m11")]
+    events --> m2[("events_y2026m12")]
+    events --> m3[("… 3 months ahead")]
+    events --> def[("events_default<br/>safety net")]
+```
+
+Every month gets its own partition with its own indexes. The application keeps reading and writing `public.events`; nothing changes in your code.
+
+**What you gain on large tables:** appends only touch the small, cached indexes of the current month instead of one huge index; autovacuum works month by month and finished months are frozen once and then left alone; old months can be detached and archived (`alter table public.events detach partition public.events_y2024m01 concurrently;` – make sure snapshots cover them, replays need every event of an aggregate).
+
+**What it costs:** queries for one aggregate carry no date, so they visit the partitions from the month the aggregate was created onwards (`aggregate_sequences.first_created_at` lets PostgreSQL skip the earlier ones). Measured in the database with 38 monthly partitions and 200,000 events in memory:
+
+| Per call, in the database | Unpartitioned | 38 partitions |
+|---|---:|---:|
+| Load an aggregate (`es_load_stream`) | 0.09 ms | 0.17 ms |
+| Append an event (`es_append_events`) | 0.22 ms | 0.38 ms |
+| Aggregate statistics | 0.09 ms | 0.53 ms |
+| Read 100 events in commit order (`es_read_all`) | 0.67 ms | 2.0 ms |
+
+Each request to Supabase takes 20 ms or more, so this is noise for the application – but there is no speed-up either while the table and its indexes fit in memory. **Partition when the events table gets large** (tens of millions of events, indexes larger than the database's memory) or when you need to archive old months; until then, the default layout is the better choice.
+
+How the conversion works:
+
+- The existing table becomes the partition `events_legacy` for everything before next month – **no data is copied and no index is rebuilt**. It runs in one transaction and blocks appends while it checks that no event is newer (one scan of the table). For very large tables, run that check beforehand without blocking writes (statements in the function's comment in [`sql/eventstore.sql`](sql/eventstore.sql)).
+- Grants, row level security and policies are carried over; partitions are closed to the API (RLS, no grants for `anon`/`authenticated`). Foreign keys referencing `events` and your own views or triggers on it must be dropped first – the function refuses otherwise.
+- Sequence numbers stay unique per aggregate: each partition has its unique index, and `es_append_events` allocates numbers under a lock per aggregate across all partitions. Ids are unique per partition (UUID v7).
+- `es_ensure_events_partitions()` creates the coming months (3 ahead by default). With `pg_cron` installed (Supabase: Database → Extensions), the conversion schedules it daily; otherwise schedule it yourself at least monthly. Events of a month without a partition are kept in `events_default` and moved to their month's partition on the next run.
+- Realtime on a partitioned table needs `alter publication supabase_realtime set (publish_via_partition_root = true);` – the function reminds you if the table was published.
+
+### Immutable events and audit logging (optional)
+
+```sql
+select public.es_enable_audit();    -- protection + pgaudit (Supabase: enable pgaudit under Database → Extensions first)
+select public.es_protect_events();  -- protection only
+```
+
+**Protection.** Triggers reject `UPDATE`, `DELETE` and `TRUNCATE` of events – for every role, including the service role, on the table and on each partition. A leaked service role key can append, but not rewrite history. Corrections are new events; the table owner can drop the trigger `es_events_immutable` if stored events really must change (which the audit log records).
+
+**Audit logging with [pgaudit](https://github.com/pgaudit/pgaudit)** – configured for new connections to the database:
+
+| Logged | Not logged |
+|---|---|
+| Attempts to update or delete events – also those the trigger rejects – with user, statement and time | Appends and reads: the events themselves already record every change of your domain, including `created_by` |
+| Deleted sequence counters (`aggregate_sequences`), deleted projection checkpoints, changed snapshots | Regular projection and snapshot work |
+| Schema changes (incl. partitions, dropped triggers) and changes of roles and privileges (`pgaudit.log = 'ddl, role'`) | Statement parameters (`pgaudit.log_parameter` stays off: event payloads may contain personal data) |
+
+Object auditing uses the role `es_auditor` (no login): its privileges select what is logged. Pass another session log class or `null` to keep yours: `select es_enable_audit('ddl, role, misc_set');`. In Supabase, find the entries under Logs → Postgres (search for `AUDIT`); log retention depends on your plan, so use a log drain to keep them longer. If your role may not change database settings, the function warns and prints the statements to run as a superuser.
+
 ### Upgrading an existing database
 
-The first run on an existing installation adds `transaction_id` and `global_position` to `events`. This **rewrites the table once and locks it** while it runs, so run it outside peak hours on large tables; existing events get positions in insertion order, and within each aggregate in sequence order. Index builds also lock writes – on very large tables create them beforehand with `create index concurrently` (statements in the script's header) and the script skips them. Duplicated sequence numbers from versions without `es_append_events` are reported with a query to find them.
+The first run on an existing installation adds `transaction_id` and `global_position` to `events` and `first_created_at` to `aggregate_sequences` (instant: nullable, unknown for existing aggregates). This **rewrites the table once and locks it** while it runs, so run it outside peak hours on large tables; existing events get positions in insertion order, and within each aggregate in sequence order. Index builds also lock writes – on very large tables create them beforehand with `create index concurrently` (statements in the script's header) and the script skips them. Duplicated sequence numbers from versions without `es_append_events` are reported with a query to find them.
 
 ## Caching & consistency of aggregate reads
 
@@ -749,6 +809,7 @@ For tests, `MemoryReadModelStore` keeps read models in memory with the same sema
 - Stored events have two new optional fields, `transaction_id` and `global_position`.
 - New ids are time-ordered UUIDs (v7) instead of random ones. They are still UUIDs; don't derive meaning from them.
 - The script warns if your event tables are reachable with the anon key. Use the service role key on the server and enable RLS.
+- New optional functions: `es_partition_events()` for monthly partitions and `es_enable_audit()` for immutable, audited events.
 - `createEventStore` creates a `SupabaseReadModelStore` for `eventStore.readModels`; it sends no requests until used.
 
 ### From 1.1

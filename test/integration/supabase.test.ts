@@ -28,11 +28,15 @@ const counter: EventProjection<{ count: number; last?: string }> = {
 };
 
 describe.skipIf(!env)('Supabase adapters against PostgREST', () => {
-    const proxies = { functions: new RestProxy(env?.url ?? ''), legacy: new RestProxy(env?.legacyUrl ?? '') };
+    const proxies = {
+        functions: new RestProxy(env?.url ?? ''),
+        legacy: new RestProxy(env?.legacyUrl ?? ''),
+        partitioned: new RestProxy(env?.partitionedUrl ?? ''),
+    };
     const clients = {} as Record<keyof typeof proxies, SupabaseClient>;
 
     beforeAll(async () => {
-        for (const name of ['functions', 'legacy'] as const) {
+        for (const name of ['functions', 'legacy', 'partitioned'] as const) {
             clients[name] = serviceRoleClient(await proxies[name].start(), env!.jwtSecret);
         }
     });
@@ -42,14 +46,13 @@ describe.skipIf(!env)('Supabase adapters against PostgREST', () => {
     });
 
     beforeEach(() => {
-        proxies.functions.reset();
-        proxies.legacy.reset();
+        for (const proxy of Object.values(proxies)) proxy.reset();
     });
 
     const store = (name: keyof typeof proxies, config: Partial<EventStoreBuilderConfig> = {}) =>
         createEventStore({ supabase: clients[name], ...config });
 
-    describe.each(['functions', 'legacy'] as const)('database %s', name => {
+    describe.each(['functions', 'legacy', 'partitioned'] as const)('database %s', name => {
         it('appends, reads and replays', async () => {
             const id = randomUUID();
             const es = store(name);

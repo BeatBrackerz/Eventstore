@@ -17,6 +17,10 @@
 --     events are read in commit order and every batch of read model changes
 --     is stored together with the projection's checkpoint in one transaction.
 --
+-- Optional, enabled by calling them once (see their sections at the end):
+--   select public.es_partition_events();  -- monthly partitions of events
+--   select public.es_enable_audit();      -- immutable events + pgaudit
+--
 -- Apply it in the Supabase SQL editor, with `psql`, or copy it into a
 -- migration (`supabase migration new eventstore`).
 --
@@ -89,11 +93,15 @@ create table if not exists public.events (
 );
 
 -- One row per aggregate, updated by every append: free space on each page
--- lets PostgreSQL update rows in place (HOT) without touching the index
+-- lets PostgreSQL update rows in place (HOT) without touching the index.
+-- first_created_at: no event of the aggregate is older (set by es_append_events; null when
+-- unknown, e.g. for aggregates appended before it existed). Lets reads of a partitioned events
+-- table skip the months before the aggregate existed. Leave it null when importing events.
 create table if not exists public.aggregate_sequences (
   aggregate_id uuid not null,
   aggregate_type varchar(255) not null,
   last_sequence integer not null default 0,
+  first_created_at timestamp with time zone,
   constraint aggregate_sequences_pkey primary key (aggregate_id, aggregate_type)
 ) with (fillfactor = 80);
 
@@ -120,6 +128,20 @@ create table if not exists public.es_projections (
 ) with (fillfactor = 50);
 
 alter table public.es_projections enable row level security;
+
+-- The tables that hold events: public.events itself, or its partitions once it is
+-- partitioned (see es_partition_events)
+create or replace function public.es_event_tables()
+returns setof regclass
+language sql
+stable
+set search_path = ''
+as $$
+  select 'public.events'::regclass
+  where (select c.relkind from pg_catalog.pg_class c where c.oid = 'public.events'::regclass) = 'r'
+  union all
+  select t.relid from pg_catalog.pg_partition_tree('public.events') as t where t.isleaf and t.level > 0
+$$;
 
 -- -----------------------------------------------------------------------------
 -- Upgrades of existing installations
@@ -179,6 +201,9 @@ begin
 end;
 $$;
 
+-- Creation time of aggregates (metadata-only change: nullable column without default)
+alter table public.aggregate_sequences add column if not exists first_created_at timestamp with time zone;
+
 -- Time-ordered ids for installations that still use random ones
 do $$
 declare
@@ -219,10 +244,15 @@ $$;
 -- events only ever receives inserts. Vacuuming (freezing, visibility map) and statistics then
 -- happen in small steps instead of after 20 % of the table changed: no large freeze bursts,
 -- current statistics for the planner and cheap index-only scans for es_projection_status.
+-- Partitioned tables have no storage of their own: their partitions get the settings.
 do $$
+declare
+  v_table regclass;
 begin
-  perform pg_temp.es_default_reloption('public.events', 'autovacuum_vacuum_insert_scale_factor', '0.05');
-  perform pg_temp.es_default_reloption('public.events', 'autovacuum_analyze_scale_factor', '0.02');
+  for v_table in select public.es_event_tables() loop
+    perform pg_temp.es_default_reloption(v_table, 'autovacuum_vacuum_insert_scale_factor', '0.05');
+    perform pg_temp.es_default_reloption(v_table, 'autovacuum_analyze_scale_factor', '0.02');
+  end loop;
   perform pg_temp.es_default_reloption('public.aggregate_sequences', 'fillfactor', '80');
 end;
 $$;
@@ -276,49 +306,97 @@ as $$
     ) = p_columns
 $$;
 
--- Reading an aggregate's stream: WHERE aggregate_id = ? AND aggregate_type = ? ORDER BY sequence_number.
--- Unique, so the database rejects duplicate sequence numbers even from outdated clients.
-do $$
+-- Indexes of a table holding events (public.events or one of its partitions), each created
+-- unless an equivalent index exists. Names start with es_<table>_.
+--   (aggregate_id, aggregate_type, sequence_number): reading an aggregate's stream. Unique, so
+--       the database rejects duplicate sequence numbers even from outdated clients.
+--   (type, created_at): getEventsByType, most recent events of a type
+--   (transaction_id, global_position): es_read_all, all events in commit order
+create or replace function public.es_ensure_event_indexes(p_table regclass)
+returns void
+language plpgsql
+set search_path = ''
+as $$
 declare
-  v_columns constant text[] := array['aggregate_id', 'aggregate_type', 'sequence_number'];
+  v_schema text;
+  v_table text;
+  v_index record;
+  v_existing record;
   v_has_duplicates boolean;
 begin
-  if exists (
-    select 1 from pg_temp.es_indexes_on('public.events', v_columns)
-    where is_unique and key_columns = cardinality(v_columns)
-  ) then
-    return;
-  end if;
+  select n.nspname, c.relname into v_schema, v_table
+  from pg_catalog.pg_class c
+  join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+  where c.oid = p_table;
 
-  select exists (
-    select 1
-    from public.events
-    group by aggregate_id, aggregate_type, sequence_number
-    having count(*) > 1
-  ) into v_has_duplicates;
+  for v_index in
+    select *
+    from (values
+      ('stream', array['aggregate_id', 'aggregate_type', 'sequence_number'], true),
+      ('type_created_at_idx', array['type', 'created_at'], false),
+      ('position_idx', array['transaction_id', 'global_position'], false)
+    ) as v(suffix, columns, is_unique)
+  loop
+    -- Indexes whose leading key columns are the wanted ones
+    select count(*) > 0 as has_any,
+           coalesce(bool_or(i.indisunique and i.indnkeyatts = cardinality(v_index.columns)), false) as has_unique
+      into v_existing
+    from pg_catalog.pg_index i
+    where i.indrelid = p_table
+      and i.indpred is null
+      and i.indnkeyatts >= cardinality(v_index.columns)
+      and (
+        select array_agg(a.attname::text order by k.ord)
+        from unnest(i.indkey::int2[]) with ordinality as k(attnum, ord)
+        join pg_catalog.pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+        where k.ord <= cardinality(v_index.columns)
+      ) = v_index.columns;
 
-  if not v_has_duplicates then
-    create unique index es_events_stream_uidx on public.events (aggregate_id, aggregate_type, sequence_number);
-    -- Created by an earlier run while duplicates existed
-    drop index if exists public.es_events_stream_idx;
-  else
-    if not exists (select 1 from pg_temp.es_indexes_on('public.events', v_columns)) then
-      create index es_events_stream_idx on public.events (aggregate_id, aggregate_type, sequence_number);
+    if not v_index.is_unique then
+      if not v_existing.has_any then
+        execute format('create index %I on %s (%s)', 'es_' || v_table || '_' || v_index.suffix, p_table,
+                       array_to_string(v_index.columns, ', '));
+      end if;
+      continue;
     end if;
-    raise warning 'eventstore: public.events contains duplicate sequence numbers (caused by concurrent appends without es_append_events). '
-      'Created a non-unique index instead of a unique one. List them with: '
-      'select aggregate_id, aggregate_type, sequence_number, count(*) from public.events group by 1, 2, 3 having count(*) > 1; '
-      'Fix them and run this script again to enforce uniqueness.';
-  end if;
+
+    if v_existing.has_unique then
+      continue;
+    end if;
+
+    execute format(
+      'select exists (select 1 from %s group by aggregate_id, aggregate_type, sequence_number having count(*) > 1)',
+      p_table
+    ) into v_has_duplicates;
+
+    if not v_has_duplicates then
+      execute format('create unique index %I on %s (aggregate_id, aggregate_type, sequence_number)',
+                     'es_' || v_table || '_stream_uidx', p_table);
+      -- Created by an earlier run while duplicates existed
+      if to_regclass(format('%I.%I', v_schema, 'es_' || v_table || '_stream_idx')) is not null then
+        execute format('drop index %I.%I', v_schema, 'es_' || v_table || '_stream_idx');
+      end if;
+    else
+      if not v_existing.has_any then
+        execute format('create index %I on %s (aggregate_id, aggregate_type, sequence_number)',
+                       'es_' || v_table || '_stream_idx', p_table);
+      end if;
+      raise warning 'eventstore: % contains duplicate sequence numbers (caused by concurrent appends without es_append_events). '
+        'Created a non-unique index instead of a unique one. List them with: '
+        'select aggregate_id, aggregate_type, sequence_number, count(*) from % group by 1, 2, 3 having count(*) > 1; '
+        'Fix them and run this script again to enforce uniqueness.', p_table, p_table;
+    end if;
+  end loop;
 end;
 $$;
 
--- getEventsByType: most recent events of a type
 do $$
+declare
+  v_table regclass;
 begin
-  if not exists (select 1 from pg_temp.es_indexes_on('public.events', array['type', 'created_at'])) then
-    create index es_events_type_created_at_idx on public.events (type, created_at);
-  end if;
+  for v_table in select public.es_event_tables() loop
+    perform public.es_ensure_event_indexes(v_table);
+  end loop;
 end;
 $$;
 
@@ -327,15 +405,6 @@ do $$
 begin
   if not exists (select 1 from pg_temp.es_indexes_on('public.snapshots', array['aggregate_id', 'aggregate_type', 'sequence_number'])) then
     create index es_snapshots_stream_idx on public.snapshots (aggregate_id, aggregate_type, sequence_number desc);
-  end if;
-end;
-$$;
-
--- Projections: reading all events in commit order (es_read_all)
-do $$
-begin
-  if not exists (select 1 from pg_temp.es_indexes_on('public.events', array['transaction_id', 'global_position'])) then
-    create index es_events_position_idx on public.events (transaction_id, global_position);
   end if;
 end;
 $$;
@@ -354,7 +423,11 @@ begin
               where k.ord <= i.indnkeyatts) as keys
       from pg_index i
       join pg_class c on c.oid = i.indexrelid
-      where i.indrelid in ('public.events'::regclass, 'public.snapshots'::regclass, 'public.aggregate_sequences'::regclass)
+      where i.indrelid in (
+          select public.es_event_tables()
+          union all select 'public.snapshots'::regclass
+          union all select 'public.aggregate_sequences'::regclass
+        )
         and i.indpred is null
         and i.indexprs is null
     )
@@ -399,6 +472,8 @@ create or replace function public.es_append_events(p_events jsonb)
 returns json
 language plpgsql
 set search_path = ''
+-- Cached generic plans skip partitions at run time; custom plans would be planned per call
+set plan_cache_mode = force_generic_plan
 as $$
 declare
   v_previous jsonb;
@@ -420,19 +495,23 @@ begin
     group by aggregate_id, aggregate_type
   ),
   reserved as (
-    -- Locking counters in a fixed order prevents deadlocks between batches touching the same aggregates
-    insert into public.aggregate_sequences as s (aggregate_id, aggregate_type, last_sequence)
-    select aggregate_id, aggregate_type, n
+    -- Locking counters in a fixed order prevents deadlocks between batches touching the same aggregates.
+    -- first_created_at stays null when it is unknown (counter created without it).
+    insert into public.aggregate_sequences as s (aggregate_id, aggregate_type, last_sequence, first_created_at)
+    select aggregate_id, aggregate_type, n, now()
     from counts
     order by aggregate_type, aggregate_id
     on conflict (aggregate_id, aggregate_type)
-      do update set last_sequence = s.last_sequence + excluded.last_sequence
-    returning s.aggregate_id, s.aggregate_type, s.last_sequence
+      do update set last_sequence = s.last_sequence + excluded.last_sequence,
+                    first_created_at = case when s.first_created_at is not null
+                                            then least(s.first_created_at, excluded.first_created_at) end
+    returning s.aggregate_id, s.aggregate_type, s.last_sequence, s.first_created_at
   )
   select coalesce(jsonb_agg(jsonb_build_object(
            'aggregate_id', r.aggregate_id,
            'aggregate_type', r.aggregate_type,
-           'last_sequence', r.last_sequence - c.n
+           'last_sequence', r.last_sequence - c.n,
+           'first_created_at', r.first_created_at
          )), '[]'::jsonb)
     into v_previous
   from reserved r
@@ -446,6 +525,7 @@ begin
       on e.aggregate_id = p.aggregate_id
      and e.aggregate_type = p.aggregate_type
      and e.sequence_number = p.last_sequence
+     and e.created_at >= coalesce(p.first_created_at, '-infinity')
     where e.transaction_id > pg_current_xact_id()
   ) then
     raise exception 'es_append_events: an append that started later committed first; retry'
@@ -485,6 +565,24 @@ begin
 end;
 $$;
 
+-- No event of the aggregate is older than this (-infinity when unknown)
+create or replace function public.es_aggregate_since(
+  p_aggregate_id public.events.aggregate_id%type,
+  p_aggregate_type public.events.aggregate_type%type
+)
+returns timestamptz
+language sql
+stable
+parallel safe
+set search_path = ''
+as $$
+  select coalesce(
+    (select s.first_created_at from public.aggregate_sequences s
+     where s.aggregate_id = p_aggregate_id and s.aggregate_type = p_aggregate_type),
+    '-infinity'
+  )
+$$;
+
 -- Load an aggregate's events, optionally starting after its latest snapshot.
 --
 -- Returns {"snapshot": <snapshot row or null>, "events": [<event rows>]}.
@@ -502,13 +600,19 @@ returns json
 language plpgsql
 stable
 set search_path = ''
+-- Cached generic plans skip partitions at run time; custom plans would be planned per call
+set plan_cache_mode = force_generic_plan
 as $$
 declare
   v_snapshot public.snapshots%rowtype;
   v_has_snapshot boolean := false;
   v_from integer := coalesce(p_from_sequence, 1);
+  v_since timestamptz;
   v_events json;
 begin
+  -- No event of the aggregate is older: on a partitioned table, earlier months are skipped
+  v_since := public.es_aggregate_since(p_aggregate_id, p_aggregate_type);
+
   if p_use_snapshot then
     select s.* into v_snapshot
     from public.snapshots s
@@ -531,6 +635,7 @@ begin
       and ev.aggregate_type = p_aggregate_type
       and ev.sequence_number >= v_from
       and (p_to_sequence is null or ev.sequence_number <= p_to_sequence)
+      and ev.created_at >= v_since
     order by ev.sequence_number, ev.id
     limit p_limit
   ) e;
@@ -550,15 +655,23 @@ create or replace function public.es_aggregate_stats(
   p_aggregate_type public.events.aggregate_type%type
 )
 returns json
-language sql
+language plpgsql
 stable
 set search_path = ''
+-- Cached generic plans skip partitions at run time; custom plans would be planned per call
+set plan_cache_mode = force_generic_plan
 as $$
+declare
+  -- On a partitioned table, months before the aggregate existed are skipped
+  v_since constant timestamptz := public.es_aggregate_since(p_aggregate_id, p_aggregate_type);
+  v_result json;
+begin
   with types as (
     select e.type, count(*) as cnt, min(e.sequence_number) as first_sequence
     from public.events e
     where e.aggregate_id = p_aggregate_id
       and e.aggregate_type = p_aggregate_type
+      and e.created_at >= v_since
     group by e.type
   )
   select json_build_object(
@@ -568,6 +681,7 @@ as $$
       from public.events e
       where e.aggregate_id = p_aggregate_id
         and e.aggregate_type = p_aggregate_type
+        and e.created_at >= v_since
       order by e.sequence_number, e.id
       limit 1
     ),
@@ -576,6 +690,7 @@ as $$
       from public.events e
       where e.aggregate_id = p_aggregate_id
         and e.aggregate_type = p_aggregate_type
+        and e.created_at >= v_since
       order by e.sequence_number desc, e.id desc
       limit 1
     ),
@@ -583,7 +698,11 @@ as $$
       (select json_agg(json_build_array(t.type, t.cnt) order by t.first_sequence, t.type) from types t),
       '[]'::json
     )
-  );
+  )
+  into v_result;
+
+  return v_result;
+end;
 $$;
 
 -- Read events of all aggregates in commit order, for projections.
@@ -875,6 +994,439 @@ select p.name,
 from public.es_projections p;
 
 -- -----------------------------------------------------------------------------
+-- Optional: immutable events and audit logging
+--
+-- Not enabled by this script. Enable once with
+--   select public.es_enable_audit();     -- protection + pgaudit
+-- or protection only with
+--   select public.es_protect_events();
+-- -----------------------------------------------------------------------------
+
+-- Events are facts: correct mistakes with new events. This trigger rejects UPDATE, DELETE and
+-- TRUNCATE of events for every role, including the service role. Only the table owner can
+-- remove it (drop trigger), which pgaudit logs as DDL.
+create or replace function public.es_events_immutable()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  raise exception 'eventstore: events are immutable (% on %.% is not allowed)', tg_op, tg_table_schema, tg_table_name
+    using errcode = '42501',
+          hint = 'Record corrections as new events. The table owner can drop the trigger es_events_immutable to change stored events anyway.';
+end;
+$$;
+
+-- Install the immutability triggers on public.events and its partitions (idempotent)
+create or replace function public.es_protect_events()
+returns void
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_table regclass;
+begin
+  -- Row triggers of a partitioned table are cloned to all its partitions, present and future
+  if not exists (
+    select 1 from pg_catalog.pg_trigger
+    where tgrelid = 'public.events'::regclass and tgname = 'es_events_immutable'
+  ) then
+    create trigger es_events_immutable
+      before update or delete on public.events
+      for each row execute function public.es_events_immutable();
+  end if;
+
+  -- TRUNCATE triggers are not cloned: one per table (es_prepare_events_partition adds them to new partitions)
+  for v_table in select 'public.events'::regclass union select public.es_event_tables() loop
+    if not exists (select 1 from pg_catalog.pg_trigger where tgrelid = v_table and tgname = 'es_events_no_truncate') then
+      execute format(
+        'create trigger es_events_no_truncate before truncate on %s for each statement execute function public.es_events_immutable()',
+        v_table
+      );
+    end if;
+  end loop;
+end;
+$$;
+
+-- Protect the events and log who tries to change them, with the pgaudit extension.
+--
+-- Object audit (role es_auditor): UPDATE and DELETE of events and of the projection
+-- checkpoints, deleted sequence counters and changed snapshots are logged – with the user,
+-- statement and time – even when the immutability trigger rejects them. Appends and reads are
+-- not logged: the events themselves are the record of every change of your domain.
+-- Session audit (p_session_log, default 'ddl, role'): schema changes (incl. partitions and
+-- dropped triggers) and changes of roles and privileges, for every user of the database.
+-- Pass null to leave pgaudit.log as it is.
+--
+-- The settings apply to new connections. Logs go to the PostgreSQL log (Supabase: Logs →
+-- Postgres); keep them longer with a log drain. Without pgaudit the events are still protected.
+create or replace function public.es_enable_audit(p_session_log text default 'ddl, role')
+returns void
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_table regclass;
+begin
+  perform public.es_protect_events();
+
+  begin
+    -- Supabase keeps extensions in the schema "extensions"
+    execute format('create extension if not exists pgaudit with schema %I',
+                   case when to_regnamespace('extensions') is not null then 'extensions' else 'public' end);
+  exception when others then
+    raise warning 'eventstore: events are protected, but pgaudit is not available (%). On Supabase, enable it under Database → Extensions; elsewhere, install it and add it to shared_preload_libraries.', sqlerrm;
+    return;
+  end;
+
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = 'es_auditor') then
+    create role es_auditor nologin;
+  end if;
+
+  -- The audit role's privileges select what is logged; it cannot log in, so they grant nothing
+  for v_table in select 'public.events'::regclass union select public.es_event_tables() loop
+    execute format('grant update, delete on %s to es_auditor', v_table);
+  end loop;
+  grant update on public.snapshots to es_auditor;
+  grant delete on public.aggregate_sequences to es_auditor;
+  grant delete on public.es_projections to es_auditor;
+
+  begin
+    execute format('alter database %I set pgaudit.role = %L', current_database(), 'es_auditor');
+    execute format('alter database %I set pgaudit.log_catalog = off', current_database());
+    if p_session_log is not null then
+      execute format('alter database %I set pgaudit.log = %L', current_database(), p_session_log);
+    end if;
+  exception when insufficient_privilege then
+    raise warning 'eventstore: events are protected and es_auditor exists, but this role may not configure pgaudit for the database (%). '
+      'Run as a superuser (on Supabase: alter role postgres set ... for the postgres role): '
+      'alter database % set pgaudit.role = ''es_auditor''; alter database % set pgaudit.log = %L;',
+      sqlerrm, current_database(), current_database(), coalesce(p_session_log, 'ddl, role');
+    return;
+  end;
+
+  raise notice 'eventstore: auditing enabled for new connections to database %', current_database();
+end;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- Optional: monthly partitions of the events table
+--
+-- Not enabled by this script. Convert once with
+--   select public.es_partition_events();
+--
+-- Each month's events live in their own partition (events_y2026m10, ...): appends only touch the
+-- small indexes of the current month, autovacuum works month by month and finished months are
+-- frozen once, and old months can be detached and archived. Reads of an aggregate's stream
+-- visit every partition's index (there is no date in such a query), so keep the number of
+-- partitions reasonable – a few years of months is fine.
+--
+-- Uniqueness of sequence numbers is enforced per partition; across partitions es_append_events
+-- guarantees it (sequence numbers are allocated under a lock per aggregate).
+-- -----------------------------------------------------------------------------
+
+-- Primary key, indexes, storage settings, access, protection and audit of a partition
+create or replace function public.es_prepare_events_partition(p_partition regclass)
+returns void
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_role text;
+begin
+  if not exists (select 1 from pg_catalog.pg_constraint where conrelid = p_partition and contype = 'p') then
+    execute format('alter table %s add primary key (id)', p_partition);
+  end if;
+
+  perform public.es_ensure_event_indexes(p_partition);
+
+  if not exists (
+    select 1 from pg_catalog.pg_class c, unnest(coalesce(c.reloptions, '{}')) as o(option)
+    where c.oid = p_partition and o.option like 'autovacuum_vacuum_insert_scale_factor=%'
+  ) then
+    execute format('alter table %s set (autovacuum_vacuum_insert_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.02)', p_partition);
+  end if;
+
+  -- Partitions are read and written through public.events (whose grants and policies apply),
+  -- never directly through the API
+  execute format('alter table %s enable row level security', p_partition);
+  foreach v_role in array array['anon', 'authenticated'] loop
+    if exists (select 1 from pg_catalog.pg_roles where rolname = v_role) then
+      execute format('revoke all on %s from %I', p_partition, v_role);
+    end if;
+  end loop;
+
+  if exists (select 1 from pg_catalog.pg_trigger where tgrelid = 'public.events'::regclass and tgname = 'es_events_immutable')
+     and not exists (select 1 from pg_catalog.pg_trigger where tgrelid = p_partition and tgname = 'es_events_no_truncate') then
+    execute format(
+      'create trigger es_events_no_truncate before truncate on %s for each statement execute function public.es_events_immutable()',
+      p_partition
+    );
+  end if;
+
+  if exists (select 1 from pg_catalog.pg_roles where rolname = 'es_auditor') then
+    execute format('grant update, delete on %s to es_auditor', p_partition);
+  end if;
+end;
+$$;
+
+-- Create the partitions of the coming months (from the current month to p_months_ahead months
+-- ahead, times in UTC) and a default partition. Safe to run any time; schedule it at least
+-- monthly – es_partition_events does that with pg_cron. Events of a month without a partition
+-- land in the default partition and are moved to their month's partition here.
+create or replace function public.es_ensure_events_partitions(p_months_ahead integer default 3)
+returns void
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_month timestamptz;
+  v_until constant timestamptz := date_trunc('month', now(), 'UTC') + make_interval(months => greatest(coalesce(p_months_ahead, 3), 0));
+  v_next timestamptz;
+  v_name text;
+begin
+  if (select c.relkind from pg_catalog.pg_class c where c.oid = 'public.events'::regclass) <> 'p' then
+    raise notice 'eventstore: public.events is not partitioned; run select public.es_partition_events(); to partition it';
+    return;
+  end if;
+
+  if to_regclass('public.events_default') is null then
+    create table public.events_default partition of public.events default;
+    perform public.es_prepare_events_partition('public.events_default');
+  end if;
+
+  -- Continue after the newest partition, but not before the current month
+  select greatest(
+           max(substring(pg_catalog.pg_get_expr(c.relpartbound, c.oid) from $re$ TO \('([^']+)'\)$re$)::timestamptz),
+           date_trunc('month', now(), 'UTC')
+         )
+    into v_month
+  from pg_catalog.pg_inherits i
+  join pg_catalog.pg_class c on c.oid = i.inhrelid
+  where i.inhparent = 'public.events'::regclass;
+
+  while v_month <= v_until loop
+    v_next := v_month + interval '1 month';
+    v_name := 'events_' || to_char(v_month at time zone 'UTC', '"y"YYYY"m"MM');
+
+    if to_regclass(format('public.%I', v_name)) is null then
+      if not exists (select 1 from public.events_default where created_at >= v_month and created_at < v_next) then
+        execute format('create table public.%I partition of public.events for values from (%L) to (%L)', v_name, v_month, v_next);
+      else
+        -- Move the month's events out of the default partition. Copies instead of DELETE,
+        -- which the immutability trigger would reject.
+        alter table public.events detach partition public.events_default;
+        execute format('create table public.%I (like public.events including defaults including compression)', v_name);
+        execute format('insert into public.%I select * from public.events_default where created_at >= $1 and created_at < $2', v_name)
+          using v_month, v_next;
+        create table public.events_default_rest (like public.events including defaults including compression);
+        insert into public.events_default_rest
+          select * from public.events_default where not (created_at >= v_month and created_at < v_next);
+        drop table public.events_default;
+        alter table public.events_default_rest rename to events_default;
+        execute format('alter table public.events attach partition public.%I for values from (%L) to (%L)', v_name, v_month, v_next);
+        alter table public.events attach partition public.events_default default;
+        perform public.es_prepare_events_partition('public.events_default');
+      end if;
+      perform public.es_prepare_events_partition(format('public.%I', v_name)::regclass);
+    end if;
+
+    v_month := v_next;
+  end loop;
+end;
+$$;
+
+-- Convert public.events into a table partitioned by month of created_at.
+--
+-- The existing table becomes the partition events_legacy for everything before next month,
+-- without copying data or rebuilding indexes; new months get their own partitions. It runs in
+-- one transaction and blocks appends while it checks that no event is newer than that (one scan
+-- of the table). For very large tables, do that check beforehand without blocking writes:
+--   alter table public.events add constraint es_events_legacy_range
+--     check (created_at < '<first day of next month>') not valid;
+--   alter table public.events validate constraint es_events_legacy_range;
+-- and run es_partition_events in the same month.
+--
+-- Grants, row level security and policies of the table are carried over. Foreign keys
+-- referencing events and views on it (other than es_projection_status) must be dropped before.
+create or replace function public.es_partition_events(p_months_ahead integer default 3)
+returns void
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_cutoff timestamptz := date_trunc('month', now(), 'UTC') + interval '1 month';
+  v_constraint record;
+  v_objects text;
+  v_sequence text;
+  v_next bigint;
+  v_protected boolean;
+  v_acl aclitem[];
+  v_view text;
+  v_view_acl aclitem[];
+  v_grant record;
+  v_policy record;
+  v_rls record;
+begin
+  if (select c.relkind from pg_catalog.pg_class c where c.oid = 'public.events'::regclass) = 'p' then
+    perform public.es_ensure_events_partitions(p_months_ahead);
+    return;
+  end if;
+
+  -- Objects that would keep pointing at the old table
+  select string_agg(c.conname || ' on ' || c.conrelid::regclass::text, ', ') into v_objects
+  from pg_catalog.pg_constraint c
+  where c.confrelid = 'public.events'::regclass and c.contype = 'f';
+  if v_objects is not null then
+    raise exception 'es_partition_events: foreign keys reference public.events (%). Drop them first: partitioned tables without a global primary key cannot be referenced.', v_objects;
+  end if;
+
+  select string_agg(distinct r.ev_class::regclass::text, ', ') into v_objects
+  from pg_catalog.pg_depend d
+  join pg_catalog.pg_rewrite r on r.oid = d.objid
+  where d.classid = 'pg_catalog.pg_rewrite'::regclass
+    and d.refobjid = 'public.events'::regclass
+    and r.ev_class <> 'public.events'::regclass
+    and r.ev_class is distinct from to_regclass('public.es_projection_status');
+  if v_objects is not null then
+    raise exception 'es_partition_events: views depend on public.events (%). Drop them first and create them again afterwards.', v_objects;
+  end if;
+
+  select string_agg(t.tgname, ', ') into v_objects
+  from pg_catalog.pg_trigger t
+  where t.tgrelid = 'public.events'::regclass and not t.tgisinternal
+    and t.tgname not in ('es_events_immutable', 'es_events_no_truncate');
+  if v_objects is not null then
+    raise exception 'es_partition_events: public.events has triggers (%). Drop them first and create them on the partitioned table afterwards.', v_objects;
+  end if;
+
+  lock table public.events in access exclusive mode;
+
+  -- No event may be newer than the legacy partition's range
+  select c.convalidated, pg_catalog.pg_get_constraintdef(c.oid) as definition into v_constraint
+  from pg_catalog.pg_constraint c
+  where c.conrelid = 'public.events'::regclass and c.conname = 'es_events_legacy_range';
+  if found then
+    v_cutoff := substring(v_constraint.definition from $re$'([^']+)'$re$)::timestamptz;
+    if not v_constraint.convalidated then
+      alter table public.events validate constraint es_events_legacy_range;
+    end if;
+  else
+    execute format('alter table public.events add constraint es_events_legacy_range check (created_at < %L)', v_cutoff);
+  end if;
+
+  -- Everything that is tied to the table and has to move to the partitioned one
+  v_protected := exists (select 1 from pg_catalog.pg_trigger where tgrelid = 'public.events'::regclass and tgname = 'es_events_immutable');
+  if v_protected then
+    drop trigger es_events_immutable on public.events;
+  end if;
+  if exists (select 1 from pg_catalog.pg_trigger where tgrelid = 'public.events'::regclass and tgname = 'es_events_no_truncate') then
+    drop trigger es_events_no_truncate on public.events;
+  end if;
+
+  select c.relacl, c.relrowsecurity as enabled, c.relforcerowsecurity as forced into v_rls
+  from pg_catalog.pg_class c where c.oid = 'public.events'::regclass;
+  v_acl := v_rls.relacl;
+
+  if to_regclass('public.es_projection_status') is not null then
+    v_view := pg_catalog.pg_get_viewdef('public.es_projection_status'::regclass);
+    select c.relacl into v_view_acl from pg_catalog.pg_class c where c.oid = 'public.es_projection_status'::regclass;
+    drop view public.es_projection_status;
+  end if;
+
+  -- Global positions continue from the identity sequence, which a partition cannot keep
+  v_sequence := pg_catalog.pg_get_serial_sequence('public.events', 'global_position');
+  if v_sequence is not null then
+    execute format('select case when is_called then last_value + 1 else last_value end from %s', v_sequence) into v_next;
+    alter table public.events alter column global_position drop identity if exists;
+  end if;
+  if v_next is null then
+    select coalesce(max(global_position), 0) + 1 into v_next from public.events;
+  end if;
+
+  alter table public.events rename to events_legacy;
+
+  create table public.events (like public.events_legacy including defaults including compression)
+    partition by range (created_at);
+  execute format('create sequence public.events_global_position_seq as bigint start with %s owned by public.events.global_position', v_next);
+  alter table public.events alter column global_position set default nextval('public.events_global_position_seq');
+
+  -- Uses the validated check constraint instead of scanning the table again
+  execute format('alter table public.events attach partition public.events_legacy for values from (minvalue) to (%L)', v_cutoff);
+  alter table public.events_legacy drop constraint es_events_legacy_range;
+
+  -- Same privileges as before (new tables may have received default privileges); the owner keeps its own
+  for v_grant in
+    select distinct a.grantee
+    from pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) as a
+    where c.oid = 'public.events'::regclass and a.grantee <> c.relowner
+  loop
+    execute format('revoke all on public.events from %s', case when v_grant.grantee = 0 then 'public' else quote_ident(pg_catalog.pg_get_userbyid(v_grant.grantee)) end);
+  end loop;
+  for v_grant in select a.grantee, a.privilege_type from pg_catalog.aclexplode(v_acl) as a loop
+    execute format('grant %s on public.events to %s', v_grant.privilege_type,
+                   case when v_grant.grantee = 0 then 'public' else quote_ident(pg_catalog.pg_get_userbyid(v_grant.grantee)) end);
+    if v_grant.privilege_type = 'INSERT' then
+      execute format('grant usage on sequence public.events_global_position_seq to %s',
+                     case when v_grant.grantee = 0 then 'public' else quote_ident(pg_catalog.pg_get_userbyid(v_grant.grantee)) end);
+    end if;
+  end loop;
+
+  if v_rls.enabled then
+    alter table public.events enable row level security;
+  end if;
+  if v_rls.forced then
+    alter table public.events force row level security;
+  end if;
+  for v_policy in
+    select * from pg_catalog.pg_policies where schemaname = 'public' and tablename = 'events_legacy'
+  loop
+    execute format('create policy %I on public.events as %s for %s to %s%s%s',
+      v_policy.policyname, v_policy.permissive, v_policy.cmd,
+      (select string_agg(case when r = 'public' then 'public' else quote_ident(r) end, ', ') from unnest(v_policy.roles) as r),
+      coalesce(' using (' || v_policy.qual || ')', ''),
+      coalesce(' with check (' || v_policy.with_check || ')', ''));
+  end loop;
+
+  if exists (select 1 from pg_catalog.pg_publication_rel where prrelid = 'public.events_legacy'::regclass) then
+    raise warning 'eventstore: events_legacy (the former events table) is in a publication. For Realtime on the partitioned table run: '
+      'alter publication supabase_realtime add table public.events; alter publication supabase_realtime set (publish_via_partition_root = true);';
+  end if;
+
+  perform public.es_prepare_events_partition('public.events_legacy');
+
+  -- A new installation needs no legacy partition
+  if not exists (select 1 from public.events_legacy) then
+    alter table public.events detach partition public.events_legacy;
+    drop table public.events_legacy;
+  end if;
+
+  perform public.es_ensure_events_partitions(p_months_ahead);
+  if v_protected then
+    perform public.es_protect_events();
+  end if;
+
+  if v_view is not null then
+    execute format('create view public.es_projection_status with (security_invoker = true) as %s', v_view);
+    for v_grant in select a.grantee, a.privilege_type from pg_catalog.aclexplode(v_view_acl) as a loop
+      execute format('grant %s on public.es_projection_status to %s', v_grant.privilege_type,
+                     case when v_grant.grantee = 0 then 'public' else quote_ident(pg_catalog.pg_get_userbyid(v_grant.grantee)) end);
+    end loop;
+  end if;
+
+  if exists (select 1 from pg_catalog.pg_extension where extname = 'pg_cron') then
+    perform cron.schedule('eventstore-partitions', '7 3 * * *', 'select public.es_ensure_events_partitions()');
+    raise notice 'eventstore: scheduled es_ensure_events_partitions daily with pg_cron (job eventstore-partitions)';
+  else
+    raise notice 'eventstore: schedule select public.es_ensure_events_partitions(); at least once a month, e.g. with pg_cron. '
+      'Until then, events of months without a partition are stored in events_default.';
+  end if;
+
+  notify pgrst, 'reload schema';
+end;
+$$;
+
+-- -----------------------------------------------------------------------------
 -- Privileges
 -- -----------------------------------------------------------------------------
 
@@ -887,9 +1439,21 @@ begin
   -- callable with the anon key or by signed-in users
   revoke execute on function public.es_read_all, public.es_project, public.es_reset_projection from public;
 
+  -- Administration: only for the table owner (e.g. postgres in the SQL editor)
+  foreach v_role in array array['public', 'anon', 'authenticated', 'service_role'] loop
+    if v_role = 'public' or exists (select 1 from pg_roles where rolname = v_role) then
+      execute format(
+        'revoke execute on function public.es_event_tables, public.es_ensure_event_indexes, public.es_events_immutable, '
+        'public.es_protect_events, public.es_enable_audit, public.es_prepare_events_partition, '
+        'public.es_ensure_events_partitions, public.es_partition_events from %s',
+        case when v_role = 'public' then 'public' else quote_ident(v_role) end
+      );
+    end if;
+  end loop;
+
   foreach v_role in array array['anon', 'authenticated', 'service_role'] loop
     if exists (select 1 from pg_roles where rolname = v_role) then
-      execute format('grant execute on function public.es_append_events, public.es_load_stream, public.es_aggregate_stats to %I', v_role);
+      execute format('grant execute on function public.es_append_events, public.es_load_stream, public.es_aggregate_stats, public.es_aggregate_since to %I', v_role);
 
       if v_role = 'service_role' then
         execute format('grant execute on function public.es_read_all, public.es_project, public.es_reset_projection to %I', v_role);

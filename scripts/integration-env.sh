@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Prepares two databases and PostgREST instances for the integration tests and benchmark:
-#   es_it         with sql/eventstore.sql and the
-#                 read model tables of the tests    -> PostgREST on port 3101
-#   es_it_legacy  with the pre-1.2 schema only      -> PostgREST on port 3102
+# Prepares three databases and PostgREST instances for the integration tests and benchmark:
+#   es_it              with sql/eventstore.sql and the
+#                      read model tables of the tests    -> PostgREST on port 3101
+#   es_it_legacy       with the pre-1.2 schema only      -> PostgREST on port 3102
+#   es_it_partitioned  like es_it, with monthly partitions
+#                      and protected, audited events     -> PostgREST on port 3103
 #
 # Needs a running PostgreSQL (connection via the usual PG* environment variables) and psql.
 # Downloads PostgREST unless POSTGREST_BIN points to a binary. Prints the environment
@@ -23,7 +25,7 @@ for role in anon authenticated service_role; do
 done
 run_psql -c "alter role service_role bypassrls"
 
-for db in es_it es_it_legacy; do
+for db in es_it es_it_legacy es_it_partitioned; do
   run_psql -c "drop database if exists $db"
   run_psql -c "create database $db"
 done
@@ -32,8 +34,14 @@ run_psql -d es_it -f sql/eventstore.sql
 run_psql -d es_it -f sql/eventstore.sql
 run_psql -d es_it -f test/integration/read-models.sql
 run_psql -d es_it_legacy -f test/integration/legacy-schema.sql
-for db in es_it es_it_legacy; do
-  run_psql -d "$db" -c "grant usage on schema public to anon, authenticated, service_role; grant all on all tables in schema public to service_role"
+# Without pgaudit (as in CI), es_enable_audit only protects the events and warns
+run_psql -d es_it_partitioned -f sql/eventstore.sql
+run_psql -d es_it_partitioned -c "select public.es_partition_events()" -c "select public.es_enable_audit()"
+run_psql -d es_it_partitioned -f sql/eventstore.sql
+run_psql -d es_it_partitioned -f test/integration/read-models.sql
+for db in es_it es_it_legacy es_it_partitioned; do
+  # As on Supabase, where default privileges cover new tables and sequences
+  run_psql -d "$db" -c "grant usage on schema public to anon, authenticated, service_role; grant all on all tables in schema public to service_role; grant usage, select on all sequences in schema public to service_role"
 done
 
 if [[ -z "${POSTGREST_BIN:-}" ]]; then
@@ -43,7 +51,7 @@ if [[ -z "${POSTGREST_BIN:-}" ]]; then
 fi
 
 credentials="$PGUSER${PGPASSWORD:+:$PGPASSWORD}"
-for instance in es_it:3101 es_it_legacy:3102; do
+for instance in es_it:3101 es_it_legacy:3102 es_it_partitioned:3103; do
   db="${instance%%:*}" port="${instance##*:}"
   cat > "$WORKDIR/$db.conf" <<EOF
 db-uri = "postgres://$credentials@$PGHOST:$PGPORT/$db"
@@ -64,4 +72,5 @@ done
 
 echo "export EVENTSTORE_IT_POSTGREST_URL=http://127.0.0.1:3101"
 echo "export EVENTSTORE_IT_POSTGREST_LEGACY_URL=http://127.0.0.1:3102"
+echo "export EVENTSTORE_IT_POSTGREST_PARTITIONED_URL=http://127.0.0.1:3103"
 echo "export EVENTSTORE_IT_JWT_SECRET=$JWT_SECRET"
