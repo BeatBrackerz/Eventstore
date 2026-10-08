@@ -1,3 +1,16 @@
+# [1.3.0](https://github.com/beatbrackerz/eventstore/compare/v1.2.0...v1.3.0) (2026-10-08)
+
+
+### Bug Fixes
+
+* keep aggregates in commit order and harden projection stores ([3a1ac90](https://github.com/beatbrackerz/eventstore/commit/3a1ac90235ee6edc5e564aeebf76a6f372d6813c))
+
+
+### Features
+
+* optional monthly partitions, immutable events and pgaudit logging ([987b237](https://github.com/beatbrackerz/eventstore/commit/987b237acac1a3faad0cf8b3847b69cb9c4da2ee))
+* projections and read models (CQRS) with exactly-once commits, optional Elasticsearch ([3201d37](https://github.com/beatbrackerz/eventstore/commit/3201d3765e23854bc209b4e224b6bb952c4660ac))
+
 # [1.2.0](https://github.com/beatbrackerz/eventstore/compare/v1.1.1...v1.2.0) (2026-09-25)
 
 
